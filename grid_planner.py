@@ -19,9 +19,15 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-CELL_SIZE = 20
-GRID_CELLS = 10
-GRID_BLOCK = CELL_SIZE * GRID_CELLS
+# --- Layout constants ---
+SMALL_CELL_PX = 20        # pixels per small (paintable) cell
+TILE_CELLS    = 10        # small cells per openGrid unit (28 mm real-world)
+TILE_PX       = SMALL_CELL_PX * TILE_CELLS   # 200 px / openGrid tile
+CANVAS_TILES  = 80        # canvas size in openGrid tiles (~2240 mm per side)
+CANVAS_PX     = CANVAS_TILES * TILE_PX
+
+MODE_PAINT    = "paint"
+MODE_ADD_GRID = "add_grid"
 
 PALETTE = [
     ("#e74c3c", "Red"),
@@ -35,16 +41,73 @@ PALETTE = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+class GridRegion:
+    """One placed openGrid tile array: n_w × n_h tiles at (tile_col, tile_row).
+    Each openGrid tile = TILE_CELLS × TILE_CELLS small paintable cells = 28 mm real."""
+
+    def __init__(self, tile_col: int, tile_row: int, n_w: int, n_h: int):
+        self.tile_col = tile_col
+        self.tile_row = tile_row
+        self.n_w = n_w
+        self.n_h = n_h
+
+    def contains_small_cell(self, col: int, row: int) -> bool:
+        sc = self.tile_col * TILE_CELLS
+        sr = self.tile_row * TILE_CELLS
+        return (sc <= col < sc + self.n_w * TILE_CELLS and
+                sr <= row < sr + self.n_h * TILE_CELLS)
+
+    def overlaps(self, other: "GridRegion") -> bool:
+        """True if this region's tile rectangle intersects other's."""
+        return not (
+            self.tile_col + self.n_w <= other.tile_col or
+            other.tile_col + other.n_w <= self.tile_col or
+            self.tile_row + self.n_h <= other.tile_row or
+            other.tile_row + other.n_h <= self.tile_row
+        )
+
+    def to_dict(self) -> dict:
+        return {"tile_col": self.tile_col, "tile_row": self.tile_row,
+                "n_w": self.n_w, "n_h": self.n_h}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "GridRegion":
+        return cls(d["tile_col"], d["tile_row"], d["n_w"], d["n_h"])
+
+
+# ---------------------------------------------------------------------------
+# Undo commands
+# ---------------------------------------------------------------------------
+
+class PlaceGridCommand(QUndoCommand):
+    """Undo/redo placing a GridRegion on the canvas."""
+
+    def __init__(self, scene, region: GridRegion):
+        super().__init__(f"Place {region.n_w}\u00d7{region.n_h} grid")
+        self._scene = scene
+        self._region = region
+
+    def redo(self):
+        self._scene._add_region(self._region)
+        logging.info("REDO place-grid %s", self._region.to_dict())
+
+    def undo(self):
+        self._scene._remove_region(self._region)
+        logging.info("UNDO place-grid %s", self._region.to_dict())
+
+
 class PaintCommand(QUndoCommand):
-    """Single undoable stroke: maps each affected cell to (old_color, new_color).
-    None means the cell was empty (no fill)."""
+    """Single undoable paint/erase stroke."""
 
     def __init__(self, scene, changes: dict, label: str):
         super().__init__(label)
         self._scene = scene
-        # changes: {(col, row): (old_color_hex_or_None, new_color_hex_or_None)}
-        self._changes = changes
-        self._first_redo = True   # changes already applied during the stroke
+        self._changes = changes   # {(col, row): (old_hex|None, new_hex|None)}
+        self._first_redo = True
 
     def redo(self):
         if self._first_redo:
@@ -55,7 +118,7 @@ class PaintCommand(QUndoCommand):
                 self._scene._remove_cell(col, row)
             else:
                 self._scene._apply_cell(col, row, QColor(new))
-        logging.info("REDO %s cells=%s", self.text(), json.dumps(list(self._changes.keys())))
+        logging.info("REDO %s cells=%s", self.text(), list(self._changes.keys()))
 
     def undo(self):
         for (col, row), (old, _) in self._changes.items():
@@ -63,23 +126,31 @@ class PaintCommand(QUndoCommand):
                 self._scene._remove_cell(col, row)
             else:
                 self._scene._apply_cell(col, row, QColor(old))
-        logging.info("UNDO %s cells=%s", self.text(), json.dumps(list(self._changes.keys())))
+        logging.info("UNDO %s cells=%s", self.text(), list(self._changes.keys()))
 
 
 class GridScene(QGraphicsScene):
     def __init__(self):
         super().__init__()
-        self.setSceneRect(0, 0, 800, 800)
-        self._cells = {}          # (col, row) -> QGraphicsRectItem
+        self.setSceneRect(0, 0, CANVAS_PX, CANVAS_PX)
+        self._cells: dict = {}            # (col, row) -> QGraphicsRectItem
+        self._regions: list = []          # list[GridRegion]
+        self._region_items: dict = {}     # id(region) -> [QGraphicsItem, ...]
         self._current_color = QColor("#3498db")
         self._pen_w = 1
         self._pen_h = 1
+        self._mode = MODE_PAINT
+        self._grid_n_w = 4
+        self._grid_n_h = 4
         self._undo_stack = QUndoStack(self)
-        self._stroke_before: dict | None = None   # snapshot before current stroke
-        self._stroke_cells: dict = {}             # changes accumulated this stroke
-        self._draw_base_grid()
+        self._stroke_cells: dict = {}
+        self._ghost = None
 
     # ------------------------------------------------------------------ public
+
+    @property
+    def undo_stack(self) -> QUndoStack:
+        return self._undo_stack
 
     def set_color(self, color: QColor):
         self._current_color = color
@@ -88,67 +159,135 @@ class GridScene(QGraphicsScene):
         self._pen_w = max(1, w)
         self._pen_h = max(1, h)
 
-    @property
-    def undo_stack(self) -> QUndoStack:
-        return self._undo_stack
+    def set_mode(self, mode: str):
+        self._mode = mode
+        if mode != MODE_ADD_GRID and self._ghost is not None:
+            self.removeItem(self._ghost)
+            self._ghost = None
 
-    # ------------------------------------------------------------------ save/load
+    def set_grid_size(self, n_w: int, n_h: int):
+        self._grid_n_w = max(1, n_w)
+        self._grid_n_h = max(1, n_h)
+        if self._ghost is not None:
+            r = self._ghost.rect()
+            self._ghost.setRect(QRectF(r.x(), r.y(),
+                                       self._grid_n_w * TILE_PX,
+                                       self._grid_n_h * TILE_PX))
 
-    def to_dict(self) -> dict:
-        """Serialize the current canvas to a plain dictionary."""
-        cells = []
-        for (col, row), item in self._cells.items():
-            cells.append({
-                "col": col,
-                "row": row,
-                "color": item.brush().color().name(),
-            })
-        return {
-            "version": 1,
-            "cell_size": CELL_SIZE,
-            "cells": cells,
-        }
+    # ------------------------------------------------------------------ region management
 
-    def load_dict(self, data: dict):
-        """Clear canvas and restore state from a dictionary."""
-        if data.get("version") != 1:
-            raise ValueError(f"Unsupported project version: {data.get('version')}")
-        # Remove all painted cells
-        for item in list(self._cells.values()):
-            self.removeItem(item)
-        self._cells.clear()
-        self._stroke_cells.clear()
-        self._undo_stack.clear()
-        for entry in data.get("cells", []):
-            self._apply_cell(entry["col"], entry["row"], QColor(entry["color"]))
+    def _draw_region(self, region: GridRegion) -> list:
+        items = []
+        x0 = region.tile_col * TILE_PX
+        y0 = region.tile_row * TILE_PX
+        w  = region.n_w * TILE_PX
+        h  = region.n_h * TILE_PX
 
-    # ------------------------------------------------------------------ grid
+        bg = self.addRect(QRectF(x0, y0, w, h),
+                          QPen(Qt.NoPen), QBrush(QColor(245, 255, 245)))
+        bg.setZValue(-3)
+        items.append(bg)
 
-    def _draw_base_grid(self):
         light_pen = QPen(QColor(200, 230, 200))
         light_pen.setWidth(1)
+        for i in range(region.n_w * TILE_CELLS + 1):
+            x = x0 + i * SMALL_CELL_PX
+            items.append(self.addLine(x, y0, x, y0 + h, light_pen))
+        for i in range(region.n_h * TILE_CELLS + 1):
+            y = y0 + i * SMALL_CELL_PX
+            items.append(self.addLine(x0, y, x0 + w, y, light_pen))
+
         medium_pen = QPen(QColor(120, 180, 120))
         medium_pen.setWidth(2)
+        for i in range(region.n_w + 1):
+            x = x0 + i * TILE_PX
+            items.append(self.addLine(x, y0, x, y0 + h, medium_pen))
+        for i in range(region.n_h + 1):
+            y = y0 + i * TILE_PX
+            items.append(self.addLine(x0, y, x0 + w, y, medium_pen))
 
-        rows = int(self.height() / CELL_SIZE)
-        cols = int(self.width() / CELL_SIZE)
+        border_pen = QPen(QColor(0, 100, 0))
+        border_pen.setWidth(3)
+        border = self.addRect(QRectF(x0, y0, w, h), border_pen, QBrush(Qt.NoBrush))
+        border.setZValue(1)
+        items.append(border)
+        return items
 
-        for r in range(rows):
-            for c in range(cols):
-                self.addRect(QRectF(c * CELL_SIZE, r * CELL_SIZE, CELL_SIZE, CELL_SIZE), light_pen)
+    def _add_region(self, region: GridRegion):
+        items = self._draw_region(region)
+        self._regions.append(region)
+        self._region_items[id(region)] = items
 
-        for r in range(0, rows, GRID_CELLS):
-            for c in range(0, cols, GRID_CELLS):
-                self.addRect(QRectF(c * CELL_SIZE, r * CELL_SIZE, GRID_BLOCK, GRID_BLOCK), medium_pen)
+    def _remove_region(self, region: GridRegion):
+        for item in self._region_items.pop(id(region), []):
+            self.removeItem(item)
+        if region in self._regions:
+            self._regions.remove(region)
+        to_del = [k for k in self._cells if region.contains_small_cell(*k)]
+        for k in to_del:
+            self.removeItem(self._cells.pop(k))
+
+    def _cell_in_any_region(self, col: int, row: int) -> bool:
+        return any(r.contains_small_cell(col, row) for r in self._regions)
+
+    # ------------------------------------------------------------------ ghost preview
+
+    def _tile_at_pos(self, scene_pos):
+        tc = int(scene_pos.x() // TILE_PX)
+        tr = int(scene_pos.y() // TILE_PX)
+        max_tc = CANVAS_TILES - self._grid_n_w
+        max_tr = CANVAS_TILES - self._grid_n_h
+        if 0 <= tc <= max_tc and 0 <= tr <= max_tr:
+            return tc, tr
+        return None
+
+    def _region_collides(self, tc: int, tr: int) -> bool:
+        """Return True if a candidate region at (tc, tr) would overlap any existing region."""
+        candidate = GridRegion(tc, tr, self._grid_n_w, self._grid_n_h)
+        return any(candidate.overlaps(r) for r in self._regions)
+
+    def _update_ghost(self, scene_pos):
+        tile = self._tile_at_pos(scene_pos) if scene_pos else None
+        if tile is None:
+            if self._ghost is not None:
+                self._ghost.setVisible(False)
+            return
+        tc, tr = tile
+        rect = QRectF(tc * TILE_PX, tr * TILE_PX,
+                      self._grid_n_w * TILE_PX, self._grid_n_h * TILE_PX)
+        collides = self._region_collides(tc, tr)
+        pen_color   = QColor(200, 0, 0, 220) if collides else QColor(0, 150, 0, 200)
+        fill_color  = QColor(255, 0, 0, 50)  if collides else QColor(0, 200, 0, 40)
+        if self._ghost is None:
+            ghost_pen = QPen(pen_color)
+            ghost_pen.setWidth(2)
+            ghost_pen.setStyle(Qt.DashLine)
+            self._ghost = self.addRect(rect, ghost_pen, QBrush(fill_color))
+            self._ghost.setZValue(10)
+        else:
+            ghost_pen = QPen(pen_color)
+            ghost_pen.setWidth(2)
+            ghost_pen.setStyle(Qt.DashLine)
+            self._ghost.setPen(ghost_pen)
+            self._ghost.setBrush(QBrush(fill_color))
+            self._ghost.setRect(rect)
+            self._ghost.setVisible(True)
 
     # ------------------------------------------------------------------ low-level cell ops
+
+    def _cell_at(self, scene_pos):
+        col = int(scene_pos.x() // SMALL_CELL_PX)
+        row = int(scene_pos.y() // SMALL_CELL_PX)
+        if 0 <= col < CANVAS_TILES * TILE_CELLS and 0 <= row < CANVAS_TILES * TILE_CELLS:
+            return col, row
+        return None
 
     def _apply_cell(self, col: int, row: int, color: QColor):
         key = (col, row)
         if key in self._cells:
             self.removeItem(self._cells[key])
         item = self.addRect(
-            QRectF(col * CELL_SIZE, row * CELL_SIZE, CELL_SIZE, CELL_SIZE),
+            QRectF(col * SMALL_CELL_PX, row * SMALL_CELL_PX, SMALL_CELL_PX, SMALL_CELL_PX),
             QPen(Qt.NoPen),
             QBrush(color),
         )
@@ -163,36 +302,27 @@ class GridScene(QGraphicsScene):
 
     # ------------------------------------------------------------------ stroke helpers
 
-    def _cell_at(self, scene_pos):
-        col = int(scene_pos.x() // CELL_SIZE)
-        row = int(scene_pos.y() // CELL_SIZE)
-        cols = int(self.width() / CELL_SIZE)
-        rows = int(self.height() / CELL_SIZE)
-        if 0 <= col < cols and 0 <= row < rows:
-            return col, row
-        return None
-
     def _affected_keys(self, col: int, row: int):
-        max_col = int(self.width() / CELL_SIZE)
-        max_row = int(self.height() / CELL_SIZE)
+        limit = CANVAS_TILES * TILE_CELLS
         for dc in range(self._pen_w):
             for dr in range(self._pen_h):
                 c, r = col + dc, row + dr
-                if 0 <= c < max_col and 0 <= r < max_row:
+                if 0 <= c < limit and 0 <= r < limit:
                     yield c, r
 
     def _snapshot_before(self, col: int, row: int):
-        """Record old state of affected cells before they are changed."""
         for c, r in self._affected_keys(col, row):
             key = (c, r)
             if key not in self._stroke_cells:
                 item = self._cells.get(key)
                 old = item.brush().color().name() if item else None
-                self._stroke_cells[key] = [old, old]   # [before, after]; after updated later
+                self._stroke_cells[key] = [old, old]
 
     def _paint_cells(self, col: int, row: int):
         self._snapshot_before(col, row)
         for c, r in self._affected_keys(col, row):
+            if not self._cell_in_any_region(c, r):
+                continue
             self._apply_cell(c, r, self._current_color)
             self._stroke_cells[(c, r)][1] = self._current_color.name()
 
@@ -207,37 +337,69 @@ class GridScene(QGraphicsScene):
         self._stroke_cells = {}
         if not changes:
             return
-        cmd = PaintCommand(self, changes, label)
-        self._undo_stack.push(cmd)
-        logging.info(
-            "COMMIT %s changed=%d cells=%s",
-            label,
-            len(changes),
-            json.dumps([[c, r, v[0], v[1]] for (c, r), v in changes.items()]),
-        )
+        self._undo_stack.push(PaintCommand(self, changes, label))
+        logging.info("COMMIT %s changed=%d", label, len(changes))
+
+    # ------------------------------------------------------------------ serialisation
+
+    def to_dict(self) -> dict:
+        return {
+            "version": 2,
+            "cells": [
+                {"col": col, "row": row, "color": item.brush().color().name()}
+                for (col, row), item in self._cells.items()
+            ],
+            "regions": [r.to_dict() for r in self._regions],
+        }
+
+    def load_dict(self, data: dict):
+        if data.get("version") not in (1, 2):
+            raise ValueError(f"Unsupported project version: {data.get('version')}")
+        for item in list(self._cells.values()):
+            self.removeItem(item)
+        self._cells.clear()
+        self._stroke_cells.clear()
+        for region in list(self._regions):
+            self._remove_region(region)
+        self._undo_stack.clear()
+        for rd in data.get("regions", []):
+            self._add_region(GridRegion.from_dict(rd))
+        for entry in data.get("cells", []):
+            self._apply_cell(entry["col"], entry["row"], QColor(entry["color"]))
 
     # ------------------------------------------------------------------ events
 
     def mousePressEvent(self, event):
-        cell = self._cell_at(event.scenePos())
-        if cell:
-            if event.button() == Qt.RightButton:
-                self._erase_cells(*cell)
-            else:
-                self._paint_cells(*cell)
+        if self._mode == MODE_ADD_GRID:
+            if event.button() == Qt.LeftButton:
+                tile = self._tile_at_pos(event.scenePos())
+                if tile and not self._region_collides(*tile):
+                    region = GridRegion(tile[0], tile[1], self._grid_n_w, self._grid_n_h)
+                    self._undo_stack.push(PlaceGridCommand(self, region))
+                    logging.info("PLACE grid %s", region.to_dict())
+        else:
+            cell = self._cell_at(event.scenePos())
+            if cell and self._cell_in_any_region(*cell):
+                if event.button() == Qt.RightButton:
+                    self._erase_cells(*cell)
+                else:
+                    self._paint_cells(*cell)
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        cell = self._cell_at(event.scenePos())
-        if cell:
-            if event.buttons() & Qt.LeftButton:
-                self._paint_cells(*cell)
-            elif event.buttons() & Qt.RightButton:
-                self._erase_cells(*cell)
+        if self._mode == MODE_ADD_GRID:
+            self._update_ghost(event.scenePos())
+        else:
+            cell = self._cell_at(event.scenePos())
+            if cell and self._cell_in_any_region(*cell):
+                if event.buttons() & Qt.LeftButton:
+                    self._paint_cells(*cell)
+                elif event.buttons() & Qt.RightButton:
+                    self._erase_cells(*cell)
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        if event.button() in (Qt.LeftButton, Qt.RightButton):
+        if self._mode == MODE_PAINT and event.button() in (Qt.LeftButton, Qt.RightButton):
             label = "erase" if event.button() == Qt.RightButton else "paint"
             self._commit_stroke(label)
         super().mouseReleaseEvent(event)
@@ -321,10 +483,178 @@ class MainWindow(QMainWindow):
         quit_act.setShortcut(QKeySequence.StandardKey.Quit)
         quit_act.triggered.connect(self.close)
 
+    def _build_shortcuts(self):
+        undo_action = self.scene.undo_stack.createUndoAction(self)
+        undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        self.addAction(undo_action)
+
+        redo_action = self.scene.undo_stack.createRedoAction(self)
+        redo_action.setShortcut(QKeySequence.StandardKey.Redo)
+        self.addAction(redo_action)
+
+    def _build_toolbar(self):
+        toolbar = self.addToolBar("Main")
+        toolbar.setMovable(False)
+
+        # --- Mode toggle ---
+        self._paint_btn = QPushButton("🖌 Paint")
+        self._paint_btn.setCheckable(True)
+        self._paint_btn.setChecked(True)
+        self._paint_btn.setToolTip("Paint mode: left=paint, right=erase")
+        self._paint_btn.clicked.connect(lambda: self._set_mode(MODE_PAINT))
+        toolbar.addWidget(self._paint_btn)
+
+        self._add_grid_btn = QPushButton("⊞ Add Grid")
+        self._add_grid_btn.setCheckable(True)
+        self._add_grid_btn.setToolTip("Grid mode: click to place an openGrid tile array")
+        self._add_grid_btn.clicked.connect(lambda: self._set_mode(MODE_ADD_GRID))
+        toolbar.addWidget(self._add_grid_btn)
+
+        toolbar.addSeparator()
+
+        # --- Grid size (N×M openGrid tiles) ---
+        gs_widget = QWidget()
+        gs_layout = QHBoxLayout(gs_widget)
+        gs_layout.setContentsMargins(4, 0, 4, 0)
+        gs_layout.setSpacing(2)
+        gs_layout.addWidget(QLabel("Grid:"))
+
+        self._spin_gw = QSpinBox()
+        self._spin_gw.setRange(1, 30)
+        self._spin_gw.setValue(4)
+        self._spin_gw.setPrefix("N ")
+        self._spin_gw.setToolTip("Grid width in openGrid tiles (28 mm each)")
+        self._spin_gw.valueChanged.connect(self._update_grid_size)
+        gs_layout.addWidget(self._spin_gw)
+
+        self._spin_gh = QSpinBox()
+        self._spin_gh.setRange(1, 30)
+        self._spin_gh.setValue(4)
+        self._spin_gh.setPrefix("M ")
+        self._spin_gh.setToolTip("Grid height in openGrid tiles (28 mm each)")
+        self._spin_gh.valueChanged.connect(self._update_grid_size)
+        gs_layout.addWidget(self._spin_gh)
+
+        toolbar.addWidget(gs_widget)
+
+        toolbar.addSeparator()
+
+        # --- Color palette ---
+        for hex_color, name in PALETTE:
+            btn = QPushButton()
+            btn.setToolTip(name)
+            btn.setFixedSize(28, 28)
+            btn.setStyleSheet(
+                f"background-color: {hex_color}; border: 2px solid #555; border-radius: 4px;"
+            )
+            color = QColor(hex_color)
+            btn.clicked.connect(lambda checked=False, c=color: self.scene.set_color(c))
+            toolbar.addWidget(btn)
+
+        custom_btn = QPushButton("Custom…")
+        custom_btn.clicked.connect(self._pick_custom_color)
+        toolbar.addWidget(custom_btn)
+
+        toolbar.addSeparator()
+
+        # --- Pen size (W×H small cells) ---
+        pen_widget = QWidget()
+        pen_layout = QHBoxLayout(pen_widget)
+        pen_layout.setContentsMargins(4, 0, 4, 0)
+        pen_layout.setSpacing(2)
+        pen_layout.addWidget(QLabel("Pen:"))
+
+        self._spin_w = QSpinBox()
+        self._spin_w.setRange(1, 20)
+        self._spin_w.setValue(1)
+        self._spin_w.setPrefix("W ")
+        self._spin_w.setToolTip("Brush width in small cells")
+        self._spin_w.valueChanged.connect(self._update_pen_size)
+        pen_layout.addWidget(self._spin_w)
+
+        self._spin_h = QSpinBox()
+        self._spin_h.setRange(1, 20)
+        self._spin_h.setValue(1)
+        self._spin_h.setPrefix("H ")
+        self._spin_h.setToolTip("Brush height in small cells")
+        self._spin_h.valueChanged.connect(self._update_pen_size)
+        pen_layout.addWidget(self._spin_h)
+
+        toolbar.addWidget(pen_widget)
+
+        toolbar.addSeparator()
+
+        # --- Undo / Redo ---
+        self._undo_btn = QPushButton("↩ Undo")
+        self._undo_btn.setToolTip("Undo  (Ctrl+Z)")
+        self._undo_btn.setEnabled(False)
+        self._undo_btn.clicked.connect(self.scene.undo_stack.undo)
+        toolbar.addWidget(self._undo_btn)
+
+        self._redo_btn = QPushButton("↪ Redo")
+        self._redo_btn.setToolTip("Redo  (Ctrl+Shift+Z)")
+        self._redo_btn.setEnabled(False)
+        self._redo_btn.clicked.connect(self.scene.undo_stack.redo)
+        toolbar.addWidget(self._redo_btn)
+
+        self.scene.undo_stack.canUndoChanged.connect(self._undo_btn.setEnabled)
+        self.scene.undo_stack.canRedoChanged.connect(self._redo_btn.setEnabled)
+
+        toolbar.addSeparator()
+
+        # --- Zoom ---
+        zoom_in_btn = QPushButton("+")
+        zoom_in_btn.setToolTip("Zoom in  (Ctrl+Scroll)")
+        zoom_in_btn.setFixedSize(28, 28)
+        zoom_in_btn.clicked.connect(self.view.zoom_in)
+        toolbar.addWidget(zoom_in_btn)
+
+        zoom_out_btn = QPushButton("−")
+        zoom_out_btn.setToolTip("Zoom out  (Ctrl+Scroll)")
+        zoom_out_btn.setFixedSize(28, 28)
+        zoom_out_btn.clicked.connect(self.view.zoom_out)
+        toolbar.addWidget(zoom_out_btn)
+
+        zoom_reset_btn = QPushButton("1:1")
+        zoom_reset_btn.setToolTip("Reset zoom")
+        zoom_reset_btn.setFixedSize(36, 28)
+        zoom_reset_btn.clicked.connect(self.view.zoom_reset)
+        toolbar.addWidget(zoom_reset_btn)
+
+        toolbar.addSeparator()
+
+        # --- Save / Open ---
+        save_btn = QPushButton("💾 Save")
+        save_btn.setToolTip("Save project  (Ctrl+S)")
+        save_btn.clicked.connect(self._save_project)
+        toolbar.addWidget(save_btn)
+
+        open_btn = QPushButton("📂 Open")
+        open_btn.setToolTip("Open project  (Ctrl+O)")
+        open_btn.clicked.connect(self._open_project)
+        toolbar.addWidget(open_btn)
+
+    # ------------------------------------------------------------------ toolbar callbacks
+
+    def _set_mode(self, mode: str):
+        self.scene.set_mode(mode)
+        self._paint_btn.setChecked(mode == MODE_PAINT)
+        self._add_grid_btn.setChecked(mode == MODE_ADD_GRID)
+
+    def _update_grid_size(self):
+        self.scene.set_grid_size(self._spin_gw.value(), self._spin_gh.value())
+
+    def _update_pen_size(self):
+        self.scene.set_pen_size(self._spin_w.value(), self._spin_h.value())
+
+    def _pick_custom_color(self):
+        color = QColorDialog.getColor(self.scene._current_color, self)
+        if color.isValid():
+            self.scene.set_color(color)
+
     # ------------------------------------------------------------------ file ops
 
     def _confirm_discard(self) -> bool:
-        """Return True if it is safe to discard the current project."""
         if self.scene.undo_stack.isClean():
             return True
         reply = QMessageBox.question(
@@ -337,7 +667,7 @@ class MainWindow(QMainWindow):
     def _new_project(self):
         if not self._confirm_discard():
             return
-        self.scene.load_dict({"version": 1, "cell_size": CELL_SIZE, "cells": []})
+        self.scene.load_dict({"version": 2, "cells": [], "regions": []})
         self._current_path = None
         self.scene.undo_stack.setClean()
         self._update_title()
@@ -388,126 +718,6 @@ class MainWindow(QMainWindow):
             event.accept()
         else:
             event.ignore()
-
-    def _build_shortcuts(self):
-        undo_action = self.scene.undo_stack.createUndoAction(self)
-        undo_action.setShortcut(QKeySequence.StandardKey.Undo)
-        self.addAction(undo_action)
-
-        redo_action = self.scene.undo_stack.createRedoAction(self)
-        redo_action.setShortcut(QKeySequence.StandardKey.Redo)
-        self.addAction(redo_action)
-
-    def _build_toolbar(self):
-        toolbar = self.addToolBar("Colors")
-        toolbar.setMovable(False)
-
-        for hex_color, name in PALETTE:
-            btn = QPushButton()
-            btn.setToolTip(name)
-            btn.setFixedSize(28, 28)
-            btn.setStyleSheet(
-                f"background-color: {hex_color}; border: 2px solid #555; border-radius: 4px;"
-            )
-            color = QColor(hex_color)
-            btn.clicked.connect(lambda checked=False, c=color: self.scene.set_color(c))
-            toolbar.addWidget(btn)
-
-        toolbar.addSeparator()
-
-        custom_btn = QPushButton("Custom…")
-        custom_btn.clicked.connect(self._pick_custom_color)
-        toolbar.addWidget(custom_btn)
-
-        toolbar.addSeparator()
-
-        # Pen size: W × H spinboxes
-        size_widget = QWidget()
-        size_layout = QHBoxLayout(size_widget)
-        size_layout.setContentsMargins(4, 0, 4, 0)
-        size_layout.setSpacing(2)
-        size_layout.addWidget(QLabel("Pen:"))
-
-        self._spin_w = QSpinBox()
-        self._spin_w.setRange(1, 20)
-        self._spin_w.setValue(1)
-        self._spin_w.setPrefix("W ")
-        self._spin_w.setToolTip("Brush width in cells")
-        self._spin_w.valueChanged.connect(self._update_pen_size)
-        size_layout.addWidget(self._spin_w)
-
-        self._spin_h = QSpinBox()
-        self._spin_h.setRange(1, 20)
-        self._spin_h.setValue(1)
-        self._spin_h.setPrefix("H ")
-        self._spin_h.setToolTip("Brush height in cells")
-        self._spin_h.valueChanged.connect(self._update_pen_size)
-        size_layout.addWidget(self._spin_h)
-
-        toolbar.addWidget(size_widget)
-
-        toolbar.addSeparator()
-
-        # Undo / Redo buttons
-        self._undo_btn = QPushButton("↩ Undo")
-        self._undo_btn.setToolTip("Undo  (Ctrl+Z)")
-        self._undo_btn.setEnabled(False)
-        self._undo_btn.clicked.connect(self.scene.undo_stack.undo)
-        toolbar.addWidget(self._undo_btn)
-
-        self._redo_btn = QPushButton("↪ Redo")
-        self._redo_btn.setToolTip("Redo  (Ctrl+Shift+Z)")
-        self._redo_btn.setEnabled(False)
-        self._redo_btn.clicked.connect(self.scene.undo_stack.redo)
-        toolbar.addWidget(self._redo_btn)
-
-        self.scene.undo_stack.canUndoChanged.connect(self._undo_btn.setEnabled)
-        self.scene.undo_stack.canRedoChanged.connect(self._redo_btn.setEnabled)
-
-        toolbar.addSeparator()
-
-        # Zoom controls
-        zoom_in_btn = QPushButton("+")
-        zoom_in_btn.setToolTip("Zoom in  (Ctrl+Scroll)")
-        zoom_in_btn.setFixedSize(28, 28)
-        zoom_in_btn.clicked.connect(self.view.zoom_in)
-        toolbar.addWidget(zoom_in_btn)
-
-        zoom_out_btn = QPushButton("−")
-        zoom_out_btn.setToolTip("Zoom out  (Ctrl+Scroll)")
-        zoom_out_btn.setFixedSize(28, 28)
-        zoom_out_btn.clicked.connect(self.view.zoom_out)
-        toolbar.addWidget(zoom_out_btn)
-
-        zoom_reset_btn = QPushButton("1:1")
-        zoom_reset_btn.setToolTip("Reset zoom")
-        zoom_reset_btn.setFixedSize(36, 28)
-        zoom_reset_btn.clicked.connect(self.view.zoom_reset)
-        toolbar.addWidget(zoom_reset_btn)
-
-        toolbar.addSeparator()
-
-        # Save / Open shortcuts in toolbar
-        save_btn = QPushButton("💾 Save")
-        save_btn.setToolTip("Save project  (Ctrl+S)")
-        save_btn.clicked.connect(self._save_project)
-        toolbar.addWidget(save_btn)
-
-        open_btn = QPushButton("📂 Open")
-        open_btn.setToolTip("Open project  (Ctrl+O)")
-        open_btn.clicked.connect(self._open_project)
-        toolbar.addWidget(open_btn)
-
-        toolbar.addSeparator()
-        toolbar.addWidget(QLabel("  Left: paint  |  Right: erase  |  Ctrl+Scroll: zoom"))
-
-    def _update_pen_size(self):
-        self.scene.set_pen_size(self._spin_w.value(), self._spin_h.value())
-
-    def _pick_custom_color(self):
-        color = QColorDialog.getColor(self.scene._current_color, self)
-        if color.isValid():
-            self.scene.set_color(color)
 
 
 if __name__ == "__main__":
