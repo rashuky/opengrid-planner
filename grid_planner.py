@@ -6,6 +6,7 @@ from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsView, QGraphicsScene,
     QPushButton, QColorDialog, QLabel, QSpinBox, QHBoxLayout, QWidget,
+    QFileDialog, QMessageBox,
 )
 from PySide6.QtGui import QPen, QColor, QBrush, QUndoStack, QUndoCommand, QKeySequence
 from PySide6.QtCore import Qt, QRectF
@@ -90,6 +91,36 @@ class GridScene(QGraphicsScene):
     @property
     def undo_stack(self) -> QUndoStack:
         return self._undo_stack
+
+    # ------------------------------------------------------------------ save/load
+
+    def to_dict(self) -> dict:
+        """Serialize the current canvas to a plain dictionary."""
+        cells = []
+        for (col, row), item in self._cells.items():
+            cells.append({
+                "col": col,
+                "row": row,
+                "color": item.brush().color().name(),
+            })
+        return {
+            "version": 1,
+            "cell_size": CELL_SIZE,
+            "cells": cells,
+        }
+
+    def load_dict(self, data: dict):
+        """Clear canvas and restore state from a dictionary."""
+        if data.get("version") != 1:
+            raise ValueError(f"Unsupported project version: {data.get('version')}")
+        # Remove all painted cells
+        for item in list(self._cells.values()):
+            self.removeItem(item)
+        self._cells.clear()
+        self._stroke_cells.clear()
+        self._undo_stack.clear()
+        for entry in data.get("cells", []):
+            self._apply_cell(entry["col"], entry["row"], QColor(entry["color"]))
 
     # ------------------------------------------------------------------ grid
 
@@ -239,17 +270,124 @@ class GridView(QGraphicsView):
         self.resetTransform()
 
 
+PROJECT_FILTER = "Grid Planner Project (*.gridplan);;All files (*)"
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Grid Planner")
+        self._current_path: Path | None = None
+        self._update_title()
 
         self.scene = GridScene()
         self.view = GridView(self.scene)
         self.setCentralWidget(self.view)
 
+        self._build_menu()
         self._build_toolbar()
         self._build_shortcuts()
+
+        self.scene.undo_stack.cleanChanged.connect(self._update_title)
+
+    def _update_title(self, clean: bool = True):
+        name = self._current_path.name if getattr(self, '_current_path', None) else "Untitled"
+        dirty = "" if clean else " ●"
+        self.setWindowTitle(f"Grid Planner — {name}{dirty}")
+
+    def _build_menu(self):
+        file_menu = self.menuBar().addMenu("&File")
+
+        new_act = file_menu.addAction("&New")
+        new_act.setShortcut(QKeySequence.StandardKey.New)
+        new_act.triggered.connect(self._new_project)
+
+        open_act = file_menu.addAction("&Open…")
+        open_act.setShortcut(QKeySequence.StandardKey.Open)
+        open_act.triggered.connect(self._open_project)
+
+        file_menu.addSeparator()
+
+        save_act = file_menu.addAction("&Save")
+        save_act.setShortcut(QKeySequence.StandardKey.Save)
+        save_act.triggered.connect(self._save_project)
+
+        save_as_act = file_menu.addAction("Save &As…")
+        save_as_act.setShortcut(QKeySequence.StandardKey.SaveAs)
+        save_as_act.triggered.connect(self._save_project_as)
+
+        file_menu.addSeparator()
+
+        quit_act = file_menu.addAction("&Quit")
+        quit_act.setShortcut(QKeySequence.StandardKey.Quit)
+        quit_act.triggered.connect(self.close)
+
+    # ------------------------------------------------------------------ file ops
+
+    def _confirm_discard(self) -> bool:
+        """Return True if it is safe to discard the current project."""
+        if self.scene.undo_stack.isClean():
+            return True
+        reply = QMessageBox.question(
+            self, "Unsaved changes",
+            "The project has unsaved changes. Discard them?",
+            QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+        )
+        return reply == QMessageBox.StandardButton.Discard
+
+    def _new_project(self):
+        if not self._confirm_discard():
+            return
+        self.scene.load_dict({"version": 1, "cell_size": CELL_SIZE, "cells": []})
+        self._current_path = None
+        self.scene.undo_stack.setClean()
+        self._update_title()
+        logging.info("NEW project")
+
+    def _open_project(self):
+        if not self._confirm_discard():
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Open project", "", PROJECT_FILTER)
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            self.scene.load_dict(data)
+            self._current_path = Path(path)
+            self.scene.undo_stack.setClean()
+            self._update_title()
+            logging.info("OPEN %s", path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Open failed", str(exc))
+
+    def _save_project(self):
+        if self._current_path is None:
+            self._save_project_as()
+            return
+        self._write_project(self._current_path)
+
+    def _save_project_as(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save project", "", PROJECT_FILTER)
+        if not path:
+            return
+        if not path.endswith(".gridplan"):
+            path += ".gridplan"
+        self._current_path = Path(path)
+        self._write_project(self._current_path)
+
+    def _write_project(self, path: Path):
+        try:
+            path.write_text(json.dumps(self.scene.to_dict(), indent=2), encoding="utf-8")
+            self.scene.undo_stack.setClean()
+            self._update_title()
+            logging.info("SAVE %s", path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Save failed", str(exc))
+
+    def closeEvent(self, event):
+        if self._confirm_discard():
+            event.accept()
+        else:
+            event.ignore()
 
     def _build_shortcuts(self):
         undo_action = self.scene.undo_stack.createUndoAction(self)
@@ -346,6 +484,19 @@ class MainWindow(QMainWindow):
         zoom_reset_btn.setFixedSize(36, 28)
         zoom_reset_btn.clicked.connect(self.view.zoom_reset)
         toolbar.addWidget(zoom_reset_btn)
+
+        toolbar.addSeparator()
+
+        # Save / Open shortcuts in toolbar
+        save_btn = QPushButton("💾 Save")
+        save_btn.setToolTip("Save project  (Ctrl+S)")
+        save_btn.clicked.connect(self._save_project)
+        toolbar.addWidget(save_btn)
+
+        open_btn = QPushButton("📂 Open")
+        open_btn.setToolTip("Open project  (Ctrl+O)")
+        open_btn.clicked.connect(self._open_project)
+        toolbar.addWidget(open_btn)
 
         toolbar.addSeparator()
         toolbar.addWidget(QLabel("  Left: paint  |  Right: erase  |  Ctrl+Scroll: zoom"))
