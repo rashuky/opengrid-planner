@@ -5,11 +5,11 @@ from datetime import datetime
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsView, QGraphicsScene,
-    QPushButton, QColorDialog, QLabel, QSpinBox, QHBoxLayout, QWidget,
-    QFileDialog, QMessageBox,
+    QPushButton, QColorDialog, QLabel, QSpinBox, QHBoxLayout, QVBoxLayout,
+    QWidget, QFileDialog, QMessageBox, QDockWidget, QButtonGroup,
 )
 from PySide6.QtGui import QPen, QColor, QBrush, QUndoStack, QUndoCommand, QKeySequence
-from PySide6.QtCore import Qt, QRectF
+from PySide6.QtCore import Qt, QRectF, Signal
 
 LOG_PATH = Path(__file__).parent / "actions.log"
 logging.basicConfig(
@@ -26,8 +26,9 @@ TILE_PX       = SMALL_CELL_PX * TILE_CELLS   # 200 px / openGrid tile
 CANVAS_TILES  = 80        # canvas size in openGrid tiles (~2240 mm per side)
 CANVAS_PX     = CANVAS_TILES * TILE_PX
 
-MODE_PAINT    = "paint"
-MODE_ADD_GRID = "add_grid"
+MODE_PAINT        = "paint"
+MODE_ADD_GRID     = "add_grid"
+MODE_ADD_CHANNEL  = "add_channel"
 
 PALETTE = [
     ("#e74c3c", "Red"),
@@ -79,6 +80,42 @@ class GridRegion:
         return cls(d["tile_col"], d["tile_row"], d["n_w"], d["n_h"])
 
 
+class Channel:
+    """An I-shaped cable channel placed on small-cell grid coordinates."""
+
+    def __init__(self, col: int, row: int, length: int, width: int, orientation: str):
+        self.col = col              # top-left small cell column
+        self.row = row              # top-left small cell row
+        self.length = length        # cells along the channel's main axis
+        self.width = width          # cells across the channel
+        self.orientation = orientation  # 'H' (horizontal) or 'V' (vertical)
+
+    def occupied_cells(self):
+        """Yield all (col, row) small cells this channel covers."""
+        len_cells = self.length * TILE_CELLS
+        wid_cells = self.width * TILE_CELLS
+        if self.orientation == 'H':
+            for dc in range(len_cells):
+                for dr in range(wid_cells):
+                    yield self.col + dc, self.row + dr
+        else:
+            for dc in range(wid_cells):
+                for dr in range(len_cells):
+                    yield self.col + dc, self.row + dr
+
+    def to_dict(self) -> dict:
+        return {
+            "type": "I",
+            "col": self.col, "row": self.row,
+            "length": self.length, "width": self.width,
+            "orientation": self.orientation,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Channel":
+        return cls(d["col"], d["row"], d["length"], d["width"], d["orientation"])
+
+
 # ---------------------------------------------------------------------------
 # Undo commands
 # ---------------------------------------------------------------------------
@@ -98,6 +135,23 @@ class PlaceGridCommand(QUndoCommand):
     def undo(self):
         self._scene._remove_region(self._region)
         logging.info("UNDO place-grid %s", self._region.to_dict())
+
+
+class PlaceChannelCommand(QUndoCommand):
+    """Undo/redo placing a Channel on the canvas."""
+
+    def __init__(self, scene, channel: Channel):
+        super().__init__("Place I channel")
+        self._scene = scene
+        self._channel = channel
+
+    def redo(self):
+        self._scene._add_channel(self._channel)
+        logging.info("REDO place-channel %s", self._channel.to_dict())
+
+    def undo(self):
+        self._scene._remove_channel(self._channel)
+        logging.info("UNDO place-channel %s", self._channel.to_dict())
 
 
 class PaintCommand(QUndoCommand):
@@ -145,6 +199,15 @@ class GridScene(QGraphicsScene):
         self._undo_stack = QUndoStack(self)
         self._stroke_cells: dict = {}
         self._ghost = None
+        # channel tracking
+        self._channels: list = []
+        self._channel_items: dict = {}  # id(channel) -> [QGraphicsItem, ...]
+        self._channel_cells: set = set()  # (col, row) cells occupied by channels
+        self._ch_length = 5
+        self._ch_width = 1
+        self._ch_orientation = 'H'
+        self._ch_ghost = None
+        self._last_scene_pos = None
 
     # ------------------------------------------------------------------ public
 
@@ -164,6 +227,9 @@ class GridScene(QGraphicsScene):
         if mode != MODE_ADD_GRID and self._ghost is not None:
             self.removeItem(self._ghost)
             self._ghost = None
+        if mode != MODE_ADD_CHANNEL and self._ch_ghost is not None:
+            self.removeItem(self._ch_ghost)
+            self._ch_ghost = None
 
     def set_grid_size(self, n_w: int, n_h: int):
         self._grid_n_w = max(1, n_w)
@@ -173,6 +239,13 @@ class GridScene(QGraphicsScene):
             self._ghost.setRect(QRectF(r.x(), r.y(),
                                        self._grid_n_w * TILE_PX,
                                        self._grid_n_h * TILE_PX))
+
+    def set_channel_params(self, length: int, width: int, orientation: str):
+        self._ch_length = max(1, length)
+        self._ch_width = max(1, width)
+        self._ch_orientation = orientation
+        if self._mode == MODE_ADD_CHANNEL:
+            self._update_ch_ghost(self._last_scene_pos)
 
     # ------------------------------------------------------------------ region management
 
@@ -229,6 +302,127 @@ class GridScene(QGraphicsScene):
 
     def _cell_in_any_region(self, col: int, row: int) -> bool:
         return any(r.contains_small_cell(col, row) for r in self._regions)
+
+    # ------------------------------------------------------------------ channel management
+
+    def _draw_channel(self, channel: Channel) -> list:
+        items = []
+        if channel.orientation == 'H':
+            x, y = channel.col * SMALL_CELL_PX, channel.row * SMALL_CELL_PX
+            w, h = channel.length * TILE_PX, channel.width * TILE_PX
+        else:
+            x, y = channel.col * SMALL_CELL_PX, channel.row * SMALL_CELL_PX
+            w, h = channel.width * TILE_PX, channel.length * TILE_PX
+
+        # Semi-transparent fill — slightly lighter than the wall colour
+        body = self.addRect(
+            QRectF(x, y, w, h),
+            QPen(Qt.NoPen),
+            QBrush(QColor(100, 140, 180, 80)),
+        )
+        body.setZValue(2)
+        items.append(body)
+
+        wall_pen = QPen(QColor(44, 80, 120))
+        wall_pen.setWidth(3)
+
+        # Draw only the closed sides (the two long walls); open ends have no edge.
+        if channel.orientation == 'H':
+            # top and bottom walls run the full length
+            items.append(self.addLine(x, y,     x + w, y,     wall_pen))
+            items.append(self.addLine(x, y + h, x + w, y + h, wall_pen))
+            # no lines drawn at x and x+w  → open ends
+        else:
+            # left and right walls run the full length
+            items.append(self.addLine(x,     y, x,     y + h, wall_pen))
+            items.append(self.addLine(x + w, y, x + w, y + h, wall_pen))
+            # no lines drawn at y and y+h  → open ends
+
+        for item in items:
+            item.setZValue(2)
+        return items
+
+    def _add_channel(self, channel: Channel):
+        items = self._draw_channel(channel)
+        self._channels.append(channel)
+        self._channel_items[id(channel)] = items
+        for cell in channel.occupied_cells():
+            self._channel_cells.add(cell)
+
+    def _remove_channel(self, channel: Channel):
+        for item in self._channel_items.pop(id(channel), []):
+            self.removeItem(item)
+        if channel in self._channels:
+            self._channels.remove(channel)
+        for cell in channel.occupied_cells():
+            self._channel_cells.discard(cell)
+
+    def _channel_candidate_cells(self, col: int, row: int):
+        """Yield cells a channel would occupy if its top-left is at (col, row)."""
+        len_cells = self._ch_length * TILE_CELLS
+        wid_cells = self._ch_width * TILE_CELLS
+        if self._ch_orientation == 'H':
+            for dc in range(len_cells):
+                for dr in range(wid_cells):
+                    yield col + dc, row + dr
+        else:
+            for dc in range(wid_cells):
+                for dr in range(len_cells):
+                    yield col + dc, row + dr
+
+    def _channel_placement_valid(self, col: int, row: int) -> bool:
+        limit = CANVAS_TILES * TILE_CELLS
+        for c, r in self._channel_candidate_cells(col, row):
+            if not (0 <= c < limit and 0 <= r < limit):
+                return False
+            if not self._cell_in_any_region(c, r):
+                return False
+            if (c, r) in self._channel_cells:
+                return False
+        return True
+
+    def _ch_ghost_rect(self, col: int, row: int) -> QRectF:
+        x, y = col * SMALL_CELL_PX, row * SMALL_CELL_PX
+        if self._ch_orientation == 'H':
+            return QRectF(x, y, self._ch_length * TILE_PX, self._ch_width * TILE_PX)
+        return QRectF(x, y, self._ch_width * TILE_PX, self._ch_length * TILE_PX)
+
+    def _tile_cell_at(self, scene_pos):
+        """Return channel origin (col, row) in small-cell coords snapped to tile grid,
+        or None if out of canvas bounds."""
+        if scene_pos is None:
+            return None
+        tc = int(scene_pos.x() // TILE_PX)
+        tr = int(scene_pos.y() // TILE_PX)
+        if 0 <= tc < CANVAS_TILES and 0 <= tr < CANVAS_TILES:
+            return tc * TILE_CELLS, tr * TILE_CELLS
+        return None
+
+    def _update_ch_ghost(self, scene_pos):
+        cell = self._tile_cell_at(scene_pos)
+        if cell is None:
+            if self._ch_ghost is not None:
+                self._ch_ghost.setVisible(False)
+            return
+        col, row = cell
+        rect = self._ch_ghost_rect(col, row)
+        valid = self._channel_placement_valid(col, row)
+        pen_color  = QColor(0, 150, 0, 200) if valid else QColor(200, 0, 0, 220)
+        fill_color = QColor(0, 200, 0, 40)  if valid else QColor(255, 0, 0, 50)
+        if self._ch_ghost is None:
+            ghost_pen = QPen(pen_color)
+            ghost_pen.setWidth(1)
+            ghost_pen.setStyle(Qt.DashLine)
+            self._ch_ghost = self.addRect(rect, ghost_pen, QBrush(fill_color))
+            self._ch_ghost.setZValue(10)
+        else:
+            ghost_pen = QPen(pen_color)
+            ghost_pen.setWidth(1)
+            ghost_pen.setStyle(Qt.DashLine)
+            self._ch_ghost.setPen(ghost_pen)
+            self._ch_ghost.setBrush(QBrush(fill_color))
+            self._ch_ghost.setRect(rect)
+            self._ch_ghost.setVisible(True)
 
     # ------------------------------------------------------------------ ghost preview
 
@@ -344,16 +538,17 @@ class GridScene(QGraphicsScene):
 
     def to_dict(self) -> dict:
         return {
-            "version": 2,
+            "version": 3,
             "cells": [
                 {"col": col, "row": row, "color": item.brush().color().name()}
                 for (col, row), item in self._cells.items()
             ],
             "regions": [r.to_dict() for r in self._regions],
+            "channels": [c.to_dict() for c in self._channels],
         }
 
     def load_dict(self, data: dict):
-        if data.get("version") not in (1, 2):
+        if data.get("version") not in (1, 2, 3):
             raise ValueError(f"Unsupported project version: {data.get('version')}")
         for item in list(self._cells.values()):
             self.removeItem(item)
@@ -361,11 +556,15 @@ class GridScene(QGraphicsScene):
         self._stroke_cells.clear()
         for region in list(self._regions):
             self._remove_region(region)
+        for channel in list(self._channels):
+            self._remove_channel(channel)
         self._undo_stack.clear()
         for rd in data.get("regions", []):
             self._add_region(GridRegion.from_dict(rd))
         for entry in data.get("cells", []):
             self._apply_cell(entry["col"], entry["row"], QColor(entry["color"]))
+        for cd in data.get("channels", []):
+            self._add_channel(Channel.from_dict(cd))
 
     # ------------------------------------------------------------------ events
 
@@ -377,6 +576,14 @@ class GridScene(QGraphicsScene):
                     region = GridRegion(tile[0], tile[1], self._grid_n_w, self._grid_n_h)
                     self._undo_stack.push(PlaceGridCommand(self, region))
                     logging.info("PLACE grid %s", region.to_dict())
+        elif self._mode == MODE_ADD_CHANNEL:
+            if event.button() == Qt.LeftButton:
+                cell = self._tile_cell_at(event.scenePos())
+                if cell and self._channel_placement_valid(*cell):
+                    channel = Channel(cell[0], cell[1],
+                                      self._ch_length, self._ch_width, self._ch_orientation)
+                    self._undo_stack.push(PlaceChannelCommand(self, channel))
+                    logging.info("PLACE channel %s", channel.to_dict())
         else:
             cell = self._cell_at(event.scenePos())
             if cell and self._cell_in_any_region(*cell):
@@ -387,8 +594,11 @@ class GridScene(QGraphicsScene):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        self._last_scene_pos = event.scenePos()
         if self._mode == MODE_ADD_GRID:
             self._update_ghost(event.scenePos())
+        elif self._mode == MODE_ADD_CHANNEL:
+            self._update_ch_ghost(event.scenePos())
         else:
             cell = self._cell_at(event.scenePos())
             if cell and self._cell_in_any_region(*cell):
@@ -435,6 +645,81 @@ class GridView(QGraphicsView):
 PROJECT_FILTER = "Grid Planner Project (*.gridplan);;All files (*)"
 
 
+class ChannelPanel(QWidget):
+    """Right-side panel for configuring channel placement (I channel)."""
+
+    params_changed = Signal(int, int, str)  # length, width, orientation
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumWidth(190)
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignTop)
+        layout.setSpacing(6)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        layout.addWidget(QLabel("<b>Channel Type</b>"))
+        type_lbl = QLabel("▬  I Channel")
+        type_lbl.setStyleSheet("color: #2c3e50; font-size: 12px; padding: 2px 0;")
+        layout.addWidget(type_lbl)
+
+        layout.addSpacing(8)
+        layout.addWidget(QLabel("Length (tiles):"))
+        self._spin_len = QSpinBox()
+        self._spin_len.setRange(1, 40)
+        self._spin_len.setValue(3)
+        layout.addWidget(self._spin_len)
+
+        layout.addSpacing(4)
+        layout.addWidget(QLabel("Width (tiles):"))
+        self._spin_w = QSpinBox()
+        self._spin_w.setRange(1, 10)
+        self._spin_w.setValue(1)
+        layout.addWidget(self._spin_w)
+
+        layout.addSpacing(8)
+        layout.addWidget(QLabel("Orientation:"))
+        orient_widget = QWidget()
+        orient_layout = QHBoxLayout(orient_widget)
+        orient_layout.setContentsMargins(0, 0, 0, 0)
+        orient_layout.setSpacing(4)
+        self._btn_h = QPushButton("— H")
+        self._btn_h.setCheckable(True)
+        self._btn_h.setChecked(True)
+        self._btn_v = QPushButton("| V")
+        self._btn_v.setCheckable(True)
+        self._orient_group = QButtonGroup(self)
+        self._orient_group.addButton(self._btn_h)
+        self._orient_group.addButton(self._btn_v)
+        self._orient_group.setExclusive(True)
+        orient_layout.addWidget(self._btn_h)
+        orient_layout.addWidget(self._btn_v)
+        layout.addWidget(orient_widget)
+
+        layout.addStretch()
+
+        self._spin_len.valueChanged.connect(self._emit)
+        self._spin_w.valueChanged.connect(self._emit)
+        self._orient_group.buttonClicked.connect(self._emit)
+
+    def _emit(self, *_):
+        self.params_changed.emit(self.length, self.width, self.orientation)
+
+    @property
+    def length(self) -> int:
+        return self._spin_len.value()
+
+    @property
+    def width(self) -> int:
+        return self._spin_w.value()
+
+    @property
+    def orientation(self) -> str:
+        return 'H' if self._btn_h.isChecked() else 'V'
+
+
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -447,6 +732,7 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self._build_toolbar()
+        self._build_channel_dock()
         self._build_shortcuts()
 
         self.scene.undo_stack.cleanChanged.connect(self._update_title)
@@ -509,6 +795,12 @@ class MainWindow(QMainWindow):
         self._add_grid_btn.setToolTip("Grid mode: click to place an openGrid tile array")
         self._add_grid_btn.clicked.connect(lambda: self._set_mode(MODE_ADD_GRID))
         toolbar.addWidget(self._add_grid_btn)
+
+        self._add_channel_btn = QPushButton("⌯ Add Channel")
+        self._add_channel_btn.setCheckable(True)
+        self._add_channel_btn.setToolTip("Channel mode: click to place a cable channel on the grid")
+        self._add_channel_btn.clicked.connect(lambda: self._set_mode(MODE_ADD_CHANNEL))
+        toolbar.addWidget(self._add_channel_btn)
 
         toolbar.addSeparator()
 
@@ -640,12 +932,36 @@ class MainWindow(QMainWindow):
         self.scene.set_mode(mode)
         self._paint_btn.setChecked(mode == MODE_PAINT)
         self._add_grid_btn.setChecked(mode == MODE_ADD_GRID)
+        self._add_channel_btn.setChecked(mode == MODE_ADD_CHANNEL)
+        self._channel_dock.setVisible(mode == MODE_ADD_CHANNEL)
 
     def _update_grid_size(self):
         self.scene.set_grid_size(self._spin_gw.value(), self._spin_gh.value())
 
     def _update_pen_size(self):
         self.scene.set_pen_size(self._spin_w.value(), self._spin_h.value())
+
+    def _build_channel_dock(self):
+        self._channel_panel = ChannelPanel()
+        self._channel_dock = QDockWidget("Channel Settings", self)
+        self._channel_dock.setWidget(self._channel_panel)
+        self._channel_dock.setAllowedAreas(Qt.RightDockWidgetArea)
+        self._channel_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable |
+            QDockWidget.DockWidgetFeature.DockWidgetFloatable
+        )
+        self.addDockWidget(Qt.RightDockWidgetArea, self._channel_dock)
+        self._channel_dock.setVisible(False)
+        self._channel_panel.params_changed.connect(self._update_channel_params)
+        # push defaults to scene
+        self.scene.set_channel_params(
+            self._channel_panel.length,
+            self._channel_panel.width,
+            self._channel_panel.orientation,
+        )
+
+    def _update_channel_params(self, length: int, width: int, orientation: str):
+        self.scene.set_channel_params(length, width, orientation)
 
     def _pick_custom_color(self):
         color = QColorDialog.getColor(self.scene._current_color, self)
