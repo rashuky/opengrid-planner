@@ -7,8 +7,9 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsView, QGraphicsScene,
     QPushButton, QColorDialog, QLabel, QSpinBox, QHBoxLayout, QVBoxLayout,
     QWidget, QFileDialog, QMessageBox, QDockWidget, QButtonGroup,
+    QGraphicsPathItem,
 )
-from PySide6.QtGui import QPen, QColor, QBrush, QUndoStack, QUndoCommand, QKeySequence
+from PySide6.QtGui import QPen, QColor, QBrush, QUndoStack, QUndoCommand, QKeySequence, QPainterPath
 from PySide6.QtCore import Qt, QRectF, Signal
 
 LOG_PATH = Path(__file__).parent / "actions.log"
@@ -113,12 +114,87 @@ class Channel:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Channel":
+        if d.get("type") == "L":
+            return LChannel.from_dict(d)
         return cls(d["col"], d["row"], d["length"], d["width"], d["orientation"])
 
 
-# ---------------------------------------------------------------------------
-# Undo commands
-# ---------------------------------------------------------------------------
+class LChannel:
+    """An L-shaped cable channel placed on tile-snapped coordinates.
+
+    The L consists of:
+      - a horizontal arm of len_x tiles long × width tiles wide
+      - a vertical arm of len_y tiles long × width tiles wide
+    They share a corner tile depending on rotation:
+      rotation 0: corner at top-left  → H arm goes right, V arm goes down
+      rotation 1: corner at top-right → H arm goes left,  V arm goes down
+      rotation 2: corner at bottom-left  → H arm goes right, V arm goes up
+      rotation 3: corner at bottom-right → H arm goes left,  V arm goes up
+    col, row are always the top-left of the bounding box.
+    """
+
+    def __init__(self, col: int, row: int,
+                 len_x: int, len_y: int, width: int, rotation: int):
+        self.col = col
+        self.row = row
+        self.len_x = len_x      # horizontal arm length in tiles
+        self.len_y = len_y      # vertical arm length in tiles
+        self.width = width      # arm width in tiles (same for both arms)
+        self.rotation = rotation  # 0/1/2/3
+
+    def _arm_rects_tiles(self):
+        """Return (h_rect, v_rect) as (tc, tr, w, h) in tile coordinates."""
+        lx, ly, w = self.len_x, self.len_y, self.width
+        tc, tr = self.col // TILE_CELLS, self.row // TILE_CELLS
+        r = self.rotation
+        if r == 0:   # corner TL: H goes right from (tc,tr), V goes down from (tc,tr)
+            h_rect = (tc, tr, lx, w)
+            v_rect = (tc, tr, w, ly)
+        elif r == 1: # corner TR: H goes left to (tc+lx-1,tr), V goes down from (tc+lx-w,tr)
+            h_rect = (tc, tr, lx, w)
+            v_rect = (tc + lx - w, tr, w, ly)
+        elif r == 2: # corner BL: H goes right from (tc,tr+ly-w), V goes up to (tc,tr+ly-1)
+            h_rect = (tc, tr + ly - w, lx, w)
+            v_rect = (tc, tr, w, ly)
+        else:        # corner BR: H goes left, V goes up
+            h_rect = (tc, tr + ly - w, lx, w)
+            v_rect = (tc + lx - w, tr, w, ly)
+        return h_rect, v_rect
+
+    def occupied_cells(self):
+        """Yield all (col, row) small cells this channel covers."""
+        seen = set()
+        for (tc, tr, tw, th) in self._arm_rects_tiles():
+            for dc in range(tw * TILE_CELLS):
+                for dr in range(th * TILE_CELLS):
+                    c = tc * TILE_CELLS + dc
+                    r = tr * TILE_CELLS + dr
+                    if (c, r) not in seen:
+                        seen.add((c, r))
+                        yield c, r
+
+    def bounding_box_px(self):
+        """Return (x, y, w, h) pixel bounding box."""
+        lx, ly = self.len_x, self.len_y
+        return (self.col * SMALL_CELL_PX,
+                self.row * SMALL_CELL_PX,
+                lx * TILE_PX,
+                ly * TILE_PX)
+
+    def to_dict(self) -> dict:
+        return {
+            "type": "L",
+            "col": self.col, "row": self.row,
+            "len_x": self.len_x, "len_y": self.len_y,
+            "width": self.width, "rotation": self.rotation,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LChannel":
+        return cls(d["col"], d["row"], d["len_x"], d["len_y"],
+                   d["width"], d["rotation"])
+
+
 
 class PlaceGridCommand(QUndoCommand):
     """Undo/redo placing a GridRegion on the canvas."""
@@ -203,9 +279,13 @@ class GridScene(QGraphicsScene):
         self._channels: list = []
         self._channel_items: dict = {}  # id(channel) -> [QGraphicsItem, ...]
         self._channel_cells: set = set()  # (col, row) cells occupied by channels
-        self._ch_length = 5
+        self._ch_type = 'I'
+        self._ch_length = 3
         self._ch_width = 1
         self._ch_orientation = 'H'
+        self._ch_len_x = 3
+        self._ch_len_y = 3
+        self._ch_rotation = 0
         self._ch_ghost = None
         self._last_scene_pos = None
 
@@ -240,10 +320,14 @@ class GridScene(QGraphicsScene):
                                        self._grid_n_w * TILE_PX,
                                        self._grid_n_h * TILE_PX))
 
-    def set_channel_params(self, length: int, width: int, orientation: str):
-        self._ch_length = max(1, length)
-        self._ch_width = max(1, width)
-        self._ch_orientation = orientation
+    def set_channel_params(self, params: dict):
+        self._ch_type = params.get('type', 'I')
+        self._ch_length = max(1, params.get('length', 3))
+        self._ch_width = max(1, params.get('width', 1))
+        self._ch_orientation = params.get('orientation', 'H')
+        self._ch_len_x = max(1, params.get('len_x', 3))
+        self._ch_len_y = max(1, params.get('len_y', 3))
+        self._ch_rotation = params.get('rotation', 0)
         if self._mode == MODE_ADD_CHANNEL:
             self._update_ch_ghost(self._last_scene_pos)
 
@@ -305,38 +389,104 @@ class GridScene(QGraphicsScene):
 
     # ------------------------------------------------------------------ channel management
 
-    def _draw_channel(self, channel: Channel) -> list:
-        items = []
-        if channel.orientation == 'H':
-            x, y = channel.col * SMALL_CELL_PX, channel.row * SMALL_CELL_PX
-            w, h = channel.length * TILE_PX, channel.width * TILE_PX
+    @staticmethod
+    def _l_channel_path(ch: "LChannel") -> QPainterPath:
+        """Build the filled L-shaped QPainterPath for an LChannel."""
+        hr, vr = ch._arm_rects_tiles()
+        path = QPainterPath()
+        for (tc, tr, tw, th) in (hr, vr):
+            path.addRect(QRectF(tc * TILE_PX, tr * TILE_PX, tw * TILE_PX, th * TILE_PX))
+        return path.simplified()
+
+    @staticmethod
+    def _l_channel_outer_wall_path(ch: "LChannel") -> QPainterPath:
+        """Open QPainterPath for the two long outer walls joined by a rounded arch at the corner."""
+        hr, vr = ch._arm_rects_tiles()
+        htc, htr, htw, hth = hr
+        vtc, vtr, vtw, vth = vr
+        hx1 = htc * TILE_PX;  hy1 = htr * TILE_PX
+        hx2 = (htc + htw) * TILE_PX;  hy2 = (htr + hth) * TILE_PX
+        vx1 = vtc * TILE_PX;  vy1 = vtr * TILE_PX
+        vx2 = (vtc + vtw) * TILE_PX;  vy2 = (vtr + vth) * TILE_PX
+        R = ch.width * TILE_PX          # outer corner radius = full arm width
+        path = QPainterPath()
+        r = ch.rotation
+        if r == 0:   # corner TL: H-top → arch → V-left
+            path.moveTo(hx2, hy1)
+            path.lineTo(hx1 + R, hy1)
+            path.arcTo(hx1, hy1, 2 * R, 2 * R, 90, 90)
+            path.lineTo(vx1, vy2)
+        elif r == 1: # corner TR: H-top → arch → V+H-right
+            path.moveTo(hx1, hy1)
+            path.lineTo(hx2 - R, hy1)
+            path.arcTo(hx2 - 2 * R, hy1, 2 * R, 2 * R, 90, -90)
+            path.lineTo(hx2, vy2)
+        elif r == 2: # corner BL: V-left → arch → H-bottom
+            path.moveTo(vx1, vy1)
+            path.lineTo(hx1, hy2 - R)
+            path.arcTo(hx1, hy2 - 2 * R, 2 * R, 2 * R, 180, 90)
+            path.lineTo(hx2, hy2)
+        else:        # corner BR: H-bottom → arch → H+V-right
+            path.moveTo(hx1, hy2)
+            path.lineTo(hx2 - R, hy2)
+            path.arcTo(hx2 - 2 * R, hy2 - 2 * R, 2 * R, 2 * R, 270, 90)
+            path.lineTo(hx2, vy1)
+        return path
+
+    @staticmethod
+    def _l_channel_inner_step_path(ch: "LChannel") -> QPainterPath:
+        """QPainterPath for the inner step (two right-angle segments at the concave corner)."""
+        hr, vr = ch._arm_rects_tiles()
+        htc, htr, htw, hth = hr
+        vtc, vtr, vtw, vth = vr
+        hx1 = htc * TILE_PX;  hy1 = htr * TILE_PX
+        hx2 = (htc + htw) * TILE_PX;  hy2 = (htr + hth) * TILE_PX
+        vx1 = vtc * TILE_PX;  vy1 = vtr * TILE_PX
+        vx2 = (vtc + vtw) * TILE_PX;  vy2 = (vtr + vth) * TILE_PX
+        path = QPainterPath()
+        r = ch.rotation
+        if r == 0:
+            path.moveTo(hx2, hy2); path.lineTo(vx2, hy2); path.lineTo(vx2, vy2)
+        elif r == 1:
+            path.moveTo(vx1, vy2); path.lineTo(vx1, hy2); path.lineTo(hx1, hy2)
+        elif r == 2:
+            path.moveTo(hx2, hy1); path.lineTo(vx2, hy1); path.lineTo(vx2, vy1)
         else:
-            x, y = channel.col * SMALL_CELL_PX, channel.row * SMALL_CELL_PX
-            w, h = channel.width * TILE_PX, channel.length * TILE_PX
+            path.moveTo(vx1, vy1); path.lineTo(vx1, hy1); path.lineTo(hx1, hy1)
+        return path
 
-        # Semi-transparent fill — slightly lighter than the wall colour
-        body = self.addRect(
-            QRectF(x, y, w, h),
-            QPen(Qt.NoPen),
-            QBrush(QColor(100, 140, 180, 80)),
-        )
-        body.setZValue(2)
-        items.append(body)
-
+    def _draw_channel(self, channel) -> list:
+        items = []
         wall_pen = QPen(QColor(44, 80, 120))
         wall_pen.setWidth(3)
+        wall_pen.setCapStyle(Qt.RoundCap)
+        wall_pen.setJoinStyle(Qt.RoundJoin)
+        fill_brush = QBrush(QColor(100, 140, 180, 80))
 
-        # Draw only the closed sides (the two long walls); open ends have no edge.
-        if channel.orientation == 'H':
-            # top and bottom walls run the full length
-            items.append(self.addLine(x, y,     x + w, y,     wall_pen))
-            items.append(self.addLine(x, y + h, x + w, y + h, wall_pen))
-            # no lines drawn at x and x+w  → open ends
+        if isinstance(channel, LChannel):
+            body = self.addPath(self._l_channel_path(channel), QPen(Qt.NoPen), fill_brush)
+            items.append(body)
+            outer = self.addPath(self._l_channel_outer_wall_path(channel),
+                                 wall_pen, QBrush(Qt.NoBrush))
+            items.append(outer)
+            inner = self.addPath(self._l_channel_inner_step_path(channel),
+                                 wall_pen, QBrush(Qt.NoBrush))
+            items.append(inner)
         else:
-            # left and right walls run the full length
-            items.append(self.addLine(x,     y, x,     y + h, wall_pen))
-            items.append(self.addLine(x + w, y, x + w, y + h, wall_pen))
-            # no lines drawn at y and y+h  → open ends
+            if channel.orientation == 'H':
+                x, y = channel.col * SMALL_CELL_PX, channel.row * SMALL_CELL_PX
+                w, h = channel.length * TILE_PX, channel.width * TILE_PX
+            else:
+                x, y = channel.col * SMALL_CELL_PX, channel.row * SMALL_CELL_PX
+                w, h = channel.width * TILE_PX, channel.length * TILE_PX
+            body = self.addRect(QRectF(x, y, w, h), QPen(Qt.NoPen), fill_brush)
+            items.append(body)
+            if channel.orientation == 'H':
+                items.append(self.addLine(x, y,     x + w, y,     wall_pen))
+                items.append(self.addLine(x, y + h, x + w, y + h, wall_pen))
+            else:
+                items.append(self.addLine(x,     y, x,     y + h, wall_pen))
+                items.append(self.addLine(x + w, y, x + w, y + h, wall_pen))
 
         for item in items:
             item.setZValue(2)
@@ -359,6 +509,11 @@ class GridScene(QGraphicsScene):
 
     def _channel_candidate_cells(self, col: int, row: int):
         """Yield cells a channel would occupy if its top-left is at (col, row)."""
+        if self._ch_type == 'L':
+            tmp = LChannel(col, row, self._ch_len_x, self._ch_len_y,
+                           self._ch_width, self._ch_rotation)
+            yield from tmp.occupied_cells()
+            return
         len_cells = self._ch_length * TILE_CELLS
         wid_cells = self._ch_width * TILE_CELLS
         if self._ch_orientation == 'H':
@@ -382,7 +537,10 @@ class GridScene(QGraphicsScene):
         return True
 
     def _ch_ghost_rect(self, col: int, row: int) -> QRectF:
+        """Bounding box for the ghost regardless of channel type."""
         x, y = col * SMALL_CELL_PX, row * SMALL_CELL_PX
+        if self._ch_type == 'L':
+            return QRectF(x, y, self._ch_len_x * TILE_PX, self._ch_len_y * TILE_PX)
         if self._ch_orientation == 'H':
             return QRectF(x, y, self._ch_length * TILE_PX, self._ch_width * TILE_PX)
         return QRectF(x, y, self._ch_width * TILE_PX, self._ch_length * TILE_PX)
@@ -405,24 +563,38 @@ class GridScene(QGraphicsScene):
                 self._ch_ghost.setVisible(False)
             return
         col, row = cell
-        rect = self._ch_ghost_rect(col, row)
         valid = self._channel_placement_valid(col, row)
         pen_color  = QColor(0, 150, 0, 200) if valid else QColor(200, 0, 0, 220)
         fill_color = QColor(0, 200, 0, 40)  if valid else QColor(255, 0, 0, 50)
-        if self._ch_ghost is None:
-            ghost_pen = QPen(pen_color)
-            ghost_pen.setWidth(1)
-            ghost_pen.setStyle(Qt.DashLine)
-            self._ch_ghost = self.addRect(rect, ghost_pen, QBrush(fill_color))
-            self._ch_ghost.setZValue(10)
+        ghost_pen = QPen(pen_color)
+        ghost_pen.setWidth(1)
+        ghost_pen.setStyle(Qt.DashLine)
+        if self._ch_type == 'L':
+            tmp = LChannel(col, row, self._ch_len_x, self._ch_len_y,
+                           self._ch_width, self._ch_rotation)
+            path = self._l_channel_path(tmp)
+            if self._ch_ghost is None or not isinstance(self._ch_ghost, QGraphicsPathItem):
+                if self._ch_ghost is not None:
+                    self.removeItem(self._ch_ghost)
+                self._ch_ghost = self.addPath(path, ghost_pen, QBrush(fill_color))
+                self._ch_ghost.setZValue(10)
+            else:
+                self._ch_ghost.setPath(path)
+                self._ch_ghost.setPen(ghost_pen)
+                self._ch_ghost.setBrush(QBrush(fill_color))
+                self._ch_ghost.setVisible(True)
         else:
-            ghost_pen = QPen(pen_color)
-            ghost_pen.setWidth(1)
-            ghost_pen.setStyle(Qt.DashLine)
-            self._ch_ghost.setPen(ghost_pen)
-            self._ch_ghost.setBrush(QBrush(fill_color))
-            self._ch_ghost.setRect(rect)
-            self._ch_ghost.setVisible(True)
+            rect = self._ch_ghost_rect(col, row)
+            if self._ch_ghost is None or isinstance(self._ch_ghost, QGraphicsPathItem):
+                if self._ch_ghost is not None:
+                    self.removeItem(self._ch_ghost)
+                self._ch_ghost = self.addRect(rect, ghost_pen, QBrush(fill_color))
+                self._ch_ghost.setZValue(10)
+            else:
+                self._ch_ghost.setPen(ghost_pen)
+                self._ch_ghost.setBrush(QBrush(fill_color))
+                self._ch_ghost.setRect(rect)
+                self._ch_ghost.setVisible(True)
 
     # ------------------------------------------------------------------ ghost preview
 
@@ -580,8 +752,13 @@ class GridScene(QGraphicsScene):
             if event.button() == Qt.LeftButton:
                 cell = self._tile_cell_at(event.scenePos())
                 if cell and self._channel_placement_valid(*cell):
-                    channel = Channel(cell[0], cell[1],
-                                      self._ch_length, self._ch_width, self._ch_orientation)
+                    if self._ch_type == 'L':
+                        channel = LChannel(cell[0], cell[1],
+                                           self._ch_len_x, self._ch_len_y,
+                                           self._ch_width, self._ch_rotation)
+                    else:
+                        channel = Channel(cell[0], cell[1],
+                                          self._ch_length, self._ch_width, self._ch_orientation)
                     self._undo_stack.push(PlaceChannelCommand(self, channel))
                     logging.info("PLACE channel %s", channel.to_dict())
         else:
@@ -646,39 +823,57 @@ PROJECT_FILTER = "Grid Planner Project (*.gridplan);;All files (*)"
 
 
 class ChannelPanel(QWidget):
-    """Right-side panel for configuring channel placement (I channel)."""
+    """Right-side panel for configuring channel placement."""
 
-    params_changed = Signal(int, int, str)  # length, width, orientation
+    params_changed = Signal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumWidth(190)
+        self.setMinimumWidth(200)
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignTop)
         layout.setSpacing(6)
         layout.setContentsMargins(10, 10, 10, 10)
 
         layout.addWidget(QLabel("<b>Channel Type</b>"))
-        type_lbl = QLabel("▬  I Channel")
-        type_lbl.setStyleSheet("color: #2c3e50; font-size: 12px; padding: 2px 0;")
-        layout.addWidget(type_lbl)
+        type_widget = QWidget()
+        type_layout = QHBoxLayout(type_widget)
+        type_layout.setContentsMargins(0, 0, 0, 0)
+        type_layout.setSpacing(4)
+        self._btn_i = QPushButton("▬  I")
+        self._btn_i.setCheckable(True)
+        self._btn_i.setChecked(True)
+        self._btn_l = QPushButton("⌐  L")
+        self._btn_l.setCheckable(True)
+        self._type_group = QButtonGroup(self)
+        self._type_group.addButton(self._btn_i)
+        self._type_group.addButton(self._btn_l)
+        self._type_group.setExclusive(True)
+        type_layout.addWidget(self._btn_i)
+        type_layout.addWidget(self._btn_l)
+        layout.addWidget(type_widget)
 
-        layout.addSpacing(8)
-        layout.addWidget(QLabel("Length (tiles):"))
+        layout.addSpacing(6)
+
+        # --- I channel params ---
+        self._i_widget = QWidget()
+        i_layout = QVBoxLayout(self._i_widget)
+        i_layout.setContentsMargins(0, 0, 0, 0)
+        i_layout.setSpacing(4)
+
+        i_layout.addWidget(QLabel("Length (tiles):"))
         self._spin_len = QSpinBox()
         self._spin_len.setRange(1, 40)
         self._spin_len.setValue(3)
-        layout.addWidget(self._spin_len)
+        i_layout.addWidget(self._spin_len)
 
-        layout.addSpacing(4)
-        layout.addWidget(QLabel("Width (tiles):"))
+        i_layout.addWidget(QLabel("Width (tiles):"))
         self._spin_w = QSpinBox()
         self._spin_w.setRange(1, 10)
         self._spin_w.setValue(1)
-        layout.addWidget(self._spin_w)
+        i_layout.addWidget(self._spin_w)
 
-        layout.addSpacing(8)
-        layout.addWidget(QLabel("Orientation:"))
+        i_layout.addWidget(QLabel("Orientation:"))
         orient_widget = QWidget()
         orient_layout = QHBoxLayout(orient_widget)
         orient_layout.setContentsMargins(0, 0, 0, 0)
@@ -694,28 +889,105 @@ class ChannelPanel(QWidget):
         self._orient_group.setExclusive(True)
         orient_layout.addWidget(self._btn_h)
         orient_layout.addWidget(self._btn_v)
-        layout.addWidget(orient_widget)
+        i_layout.addWidget(orient_widget)
+
+        layout.addWidget(self._i_widget)
+
+        # --- L channel params ---
+        self._l_widget = QWidget()
+        l_layout = QVBoxLayout(self._l_widget)
+        l_layout.setContentsMargins(0, 0, 0, 0)
+        l_layout.setSpacing(4)
+
+        l_layout.addWidget(QLabel("X length (tiles):"))
+        self._spin_lx = QSpinBox()
+        self._spin_lx.setRange(2, 40)
+        self._spin_lx.setValue(4)
+        l_layout.addWidget(self._spin_lx)
+
+        l_layout.addWidget(QLabel("Y length (tiles):"))
+        self._spin_ly = QSpinBox()
+        self._spin_ly.setRange(2, 40)
+        self._spin_ly.setValue(4)
+        l_layout.addWidget(self._spin_ly)
+
+        l_layout.addWidget(QLabel("Width (tiles):"))
+        self._spin_lw = QSpinBox()
+        self._spin_lw.setRange(1, 10)
+        self._spin_lw.setValue(1)
+        l_layout.addWidget(self._spin_lw)
+
+        l_layout.addWidget(QLabel("Corner (rotation):"))
+        rot_widget = QWidget()
+        rot_layout = QHBoxLayout(rot_widget)
+        rot_layout.setContentsMargins(0, 0, 0, 0)
+        rot_layout.setSpacing(2)
+        self._rot_btns = []
+        self._rot_group = QButtonGroup(self)
+        # symbol shows where the open "notch" / inner corner is
+        # rot 0: corner TL → shape looks like ⌐ (top-right open area)
+        # rot 1: corner TR → shape looks like Γ (top-left open)
+        # rot 2: corner BL → shape looks like L (bottom-right open)
+        # rot 3: corner BR → shape looks like J (bottom-left open)
+        for i, (lbl, tip) in enumerate([
+            ("⌐", "Corner top-left"),
+            ("Γ", "Corner top-right"),
+            ("L", "Corner bottom-left"),
+            ("J", "Corner bottom-right"),
+        ]):
+            btn = QPushButton(lbl)
+            btn.setCheckable(True)
+            btn.setFixedSize(32, 28)
+            btn.setToolTip(tip)
+            self._rot_group.addButton(btn, i)
+            rot_layout.addWidget(btn)
+            self._rot_btns.append(btn)
+        self._rot_btns[0].setChecked(True)
+        l_layout.addWidget(rot_widget)
+
+        self._l_widget.setVisible(False)
+        layout.addWidget(self._l_widget)
 
         layout.addStretch()
 
+        # connect all
+        self._type_group.buttonClicked.connect(self._on_type_changed)
         self._spin_len.valueChanged.connect(self._emit)
         self._spin_w.valueChanged.connect(self._emit)
         self._orient_group.buttonClicked.connect(self._emit)
+        self._spin_lx.valueChanged.connect(self._emit)
+        self._spin_ly.valueChanged.connect(self._emit)
+        self._spin_lw.valueChanged.connect(self._emit)
+        self._rot_group.buttonClicked.connect(self._emit)
+
+    def _on_type_changed(self, *_):
+        is_l = self._btn_l.isChecked()
+        self._i_widget.setVisible(not is_l)
+        self._l_widget.setVisible(is_l)
+        self._emit()
 
     def _emit(self, *_):
-        self.params_changed.emit(self.length, self.width, self.orientation)
+        self.params_changed.emit(self._params())
+
+    def _params(self) -> dict:
+        if self._btn_l.isChecked():
+            return {
+                'type': 'L',
+                'len_x': self._spin_lx.value(),
+                'len_y': self._spin_ly.value(),
+                'width': self._spin_lw.value(),
+                'rotation': self._rot_group.checkedId(),
+            }
+        return {
+            'type': 'I',
+            'length': self._spin_len.value(),
+            'width': self._spin_w.value(),
+            'orientation': 'H' if self._btn_h.isChecked() else 'V',
+        }
 
     @property
-    def length(self) -> int:
-        return self._spin_len.value()
-
-    @property
-    def width(self) -> int:
-        return self._spin_w.value()
-
-    @property
-    def orientation(self) -> str:
-        return 'H' if self._btn_h.isChecked() else 'V'
+    def params(self) -> dict:
+        return self._params()
 
 
 
@@ -954,14 +1226,10 @@ class MainWindow(QMainWindow):
         self._channel_dock.setVisible(False)
         self._channel_panel.params_changed.connect(self._update_channel_params)
         # push defaults to scene
-        self.scene.set_channel_params(
-            self._channel_panel.length,
-            self._channel_panel.width,
-            self._channel_panel.orientation,
-        )
+        self.scene.set_channel_params(self._channel_panel.params)
 
-    def _update_channel_params(self, length: int, width: int, orientation: str):
-        self.scene.set_channel_params(length, width, orientation)
+    def _update_channel_params(self, params: dict):
+        self.scene.set_channel_params(params)
 
     def _pick_custom_color(self):
         color = QColorDialog.getColor(self.scene._current_color, self)
