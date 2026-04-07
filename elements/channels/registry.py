@@ -5,13 +5,14 @@ No other file needs to change.
 """
 from elements.channels.i_channel import IChannel
 from elements.channels.l_channel import LChannel
-# from elements.channels.t_channel import TChannel  # future example
+from elements.channels.t_channel import TChannel
 
 from elements.channels.base import Channel
 
 _REGISTRY: dict[str, type[Channel]] = {
     "I": IChannel,
     "L": LChannel,
+    "T": TChannel,
 }
 
 

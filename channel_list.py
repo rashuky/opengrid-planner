@@ -10,9 +10,15 @@ def _channel_label(ch: Channel) -> str:
     t = d['type']
     if t == 'I':
         return f"I  {d['orientation']}  len={d['length']}  w={d['width']}"
-    corners = ['top-left', 'top-right', 'bot-left', 'bot-right']
-    corner = corners[d.get('rotation', 0)]
-    return f"L {corner}  x={d['len_x']} y={d['len_y']} w={d['width']}"
+    if t == 'L':
+        corners = ['top-left', 'top-right', 'bot-left', 'bot-right']
+        corner = corners[d.get('rotation', 0)]
+        return f"L {corner}  x={d['len_x']} y={d['len_y']} w={d['width']}"
+    # T
+    stem_dir = ['\u2193', '\u2192', '\u2191', '\u2190'][d.get('rotation', 0)]
+    return (f"T {stem_dir}  s:{d['stem_len']}\u00d7{d['stem_w']}"
+            f"  l:{d['left_len']}\u00d7{d['left_w']}"
+            f"  r:{d['right_len']}\u00d7{d['right_w']}")
 
 
 class ChannelListPanel(QWidget):

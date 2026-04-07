@@ -13,6 +13,7 @@ from elements.opengrid.region import GridRegion
 from elements.channels.base import Channel
 from elements.channels.i_channel import IChannel
 from elements.channels.l_channel import LChannel
+from elements.channels.t_channel import TChannel
 from elements.channels.registry import channel_from_dict
 from commands import PlaceGridCommand, PlaceChannelCommand, PaintCommand, DeleteChannelCommand, EditChannelCommand
 
@@ -49,6 +50,13 @@ class GridScene(QGraphicsScene):
         self._ch_len_x = 3
         self._ch_len_y = 3
         self._ch_rotation = 0
+        # T channel params
+        self._ch_stem_len = 3
+        self._ch_stem_w = 1
+        self._ch_left_len = 3
+        self._ch_left_w = 1
+        self._ch_right_len = 3
+        self._ch_right_w = 1
         self._ch_ghost = None
         self._last_scene_pos = None
         # selection / editing state
@@ -109,6 +117,12 @@ class GridScene(QGraphicsScene):
         self._ch_len_x = max(0, params.get('len_x', 3))
         self._ch_len_y = max(0, params.get('len_y', 3))
         self._ch_rotation = params.get('rotation', 0)
+        self._ch_stem_len = max(0, params.get('stem_len', 3))
+        self._ch_stem_w   = max(1, params.get('stem_w',   1))
+        self._ch_left_len = max(0, params.get('left_len', 3))
+        self._ch_left_w   = max(1, params.get('left_w',   1))
+        self._ch_right_len = max(0, params.get('right_len', 3))
+        self._ch_right_w   = max(1, params.get('right_w',   1))
         if self._mode == MODE_ADD_CHANNEL:
             self._update_ch_ghost(self._last_scene_pos)
 
@@ -179,6 +193,12 @@ class GridScene(QGraphicsScene):
         if self._ch_type == 'L':
             return LChannel(col, row, self._ch_len_x, self._ch_len_y,
                             self._ch_width, self._ch_rotation)
+        if self._ch_type == 'T':
+            return TChannel(col, row,
+                            self._ch_stem_len, self._ch_stem_w,
+                            self._ch_left_len, self._ch_left_w,
+                            self._ch_right_len, self._ch_right_w,
+                            self._ch_rotation)
         return IChannel(col, row, self._ch_length, self._ch_width, self._ch_orientation)
 
     def _draw_channel(self, channel: Channel) -> list:
@@ -301,7 +321,7 @@ class GridScene(QGraphicsScene):
             return
         src = self._edit_source_ch if self._editing else self._selected_ch
         d = src.to_dict()
-        if d['type'] == 'L':
+        if d['type'] in ('L', 'T'):
             cur = self._edit_rotation if self._editing else d['rotation']
             self._edit_rotation = (cur + 1) % 4
             self._edit_orientation = 'H'
@@ -342,6 +362,17 @@ class GridScene(QGraphicsScene):
                 params.get('width', d['width']),
                 params.get('rotation', d['rotation']),
             )
+        elif d['type'] == 'T':
+            new_ch = TChannel(
+                old.col, old.row,
+                params.get('stem_len',  d['stem_len']),
+                params.get('stem_w',    d['stem_w']),
+                params.get('left_len',  d['left_len']),
+                params.get('left_w',    d['left_w']),
+                params.get('right_len', d['right_len']),
+                params.get('right_w',   d['right_w']),
+                params.get('rotation',  d['rotation']),
+            )
         else:
             new_ch = IChannel(
                 old.col, old.row,
@@ -375,6 +406,12 @@ class GridScene(QGraphicsScene):
         if d['type'] == 'L':
             return LChannel(col, row, d['len_x'], d['len_y'],
                             d['width'], self._edit_rotation)
+        if d['type'] == 'T':
+            return TChannel(col, row,
+                            d['stem_len'], d['stem_w'],
+                            d['left_len'], d['left_w'],
+                            d['right_len'], d['right_w'],
+                            self._edit_rotation)
         return IChannel(col, row, d['length'], d['width'], self._edit_orientation)
 
     def _channel_placement_valid_edit(self, col: int, row: int) -> bool:
