@@ -1,5 +1,4 @@
 """LChannel: L-shaped cable channel with a rounded outer corner."""
-from PySide6.QtCore import QRectF
 from PySide6.QtGui import QPainterPath
 
 from constants import TILE_CELLS, TILE_PX
@@ -43,8 +42,12 @@ class LChannel(Channel):
     # ------------------------------------------------------------------
 
     def _arm_rects_tiles(self):
-        """Return (h_rect, v_rect) as (tc, tr, w, h) in tile coordinates."""
-        lx, ly, w = self.len_x, self.len_y, self.width
+        """Return (h_rect, v_rect) as (tc, tr, w, h) in tile coordinates.
+
+        len_x / len_y are the straight extensions *beyond* the corner square,
+        so the total tile span in each direction is len + width.
+        """
+        lx, ly, w = self.len_x + self.width, self.len_y + self.width, self.width
         tc, tr = self.col // TILE_CELLS, self.row // TILE_CELLS
         r = self.rotation
         if r == 0:
@@ -85,16 +88,54 @@ class LChannel(Channel):
         return (
             self.col * SMALL_CELL_PX,
             self.row * SMALL_CELL_PX,
-            self.len_x * TILE_PX,
-            self.len_y * TILE_PX,
+            (self.len_x + self.width) * TILE_PX,
+            (self.len_y + self.width) * TILE_PX,
         )
 
     def fill_path(self) -> QPainterPath:
-        """Union of the two arm rectangles."""
+        """Closed L-shaped contour with a quarter-circle rounded outer corner.
+
+        Traces the full perimeter so the filled region matches what is visible
+        between the outer arch wall and the inner step walls.
+        """
+        hx1, hy1, hx2, hy2, vx1, vy1, vx2, vy2 = self._arm_px()
+        R = self.width * TILE_PX
         path = QPainterPath()
-        for (tc, tr, tw, th) in self._arm_rects_tiles():
-            path.addRect(QRectF(tc * TILE_PX, tr * TILE_PX, tw * TILE_PX, th * TILE_PX))
-        return path.simplified()
+        r = self.rotation
+        if r == 0:   # outer corner TL
+            path.moveTo(hx2, hy1)
+            path.lineTo(hx1 + R, hy1)
+            path.arcTo(hx1, hy1, 2 * R, 2 * R, 90, 90)
+            path.lineTo(vx1, vy2)
+            path.lineTo(vx2, vy2)
+            path.lineTo(vx2, hy2)
+            path.lineTo(hx2, hy2)
+        elif r == 1: # outer corner TR
+            path.moveTo(hx1, hy1)
+            path.lineTo(hx2 - R, hy1)
+            path.arcTo(hx2 - 2 * R, hy1, 2 * R, 2 * R, 90, -90)
+            path.lineTo(hx2, vy2)
+            path.lineTo(vx1, vy2)
+            path.lineTo(vx1, hy2)
+            path.lineTo(hx1, hy2)
+        elif r == 2: # outer corner BL
+            path.moveTo(vx1, vy1)
+            path.lineTo(hx1, hy2 - R)
+            path.arcTo(hx1, hy2 - 2 * R, 2 * R, 2 * R, 180, 90)
+            path.lineTo(hx2, hy2)
+            path.lineTo(hx2, hy1)
+            path.lineTo(vx2, hy1)
+            path.lineTo(vx2, vy1)
+        else:        # outer corner BR
+            path.moveTo(hx1, hy2)
+            path.lineTo(hx2 - R, hy2)
+            path.arcTo(hx2 - 2 * R, hy2 - 2 * R, 2 * R, 2 * R, 270, 90)
+            path.lineTo(hx2, vy1)
+            path.lineTo(vx1, vy1)
+            path.lineTo(vx1, hy1)
+            path.lineTo(hx1, hy1)
+        path.closeSubpath()
+        return path
 
     def wall_paths(self) -> list:
         """Two paths: outer wall with rounded arch, and inner concave step."""
