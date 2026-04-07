@@ -210,6 +210,9 @@ class GridScene(QGraphicsScene):
 
     def _remove_channel(self, channel: Channel, update_selection: bool = True):
         cid = id(channel)
+        # Restore normal style before items are removed (selection overlay is in-place)
+        if self._selected_ch is channel:
+            self._restore_channel_style(channel)
         for item in self._channel_items.pop(cid, []):
             self.removeItem(item)
         if channel in self._channels:
@@ -217,7 +220,7 @@ class GridScene(QGraphicsScene):
         for cell in channel.occupied_cells():
             self._channel_cells.discard(cell)
         if update_selection and self._selected_ch is channel:
-            self._clear_selection_overlay()
+            self._selection_items = []
             self._selected_ch = None
             self.channel_selection_changed.emit(None)
         self.channel_erased.emit(cid)
@@ -243,18 +246,40 @@ class GridScene(QGraphicsScene):
             self.channel_selection_changed.emit(None)
 
     def _draw_selection_overlay(self, channel: Channel):
-        x, y, w, h = channel.bounding_box_px()
-        sel_pen = QPen(QColor(255, 165, 0))
-        sel_pen.setWidth(2)
-        sel_pen.setStyle(Qt.DashLine)
-        item = self.addRect(QRectF(x, y, w, h), sel_pen, QBrush(Qt.NoBrush))
-        item.setZValue(5)
-        self._selection_items = [item]
+        """Restyle the channel's own items to show it is selected."""
+        items = self._channel_items.get(id(channel), [])
+        if not items:
+            return
+        sel_fill = QBrush(QColor(255, 165, 0, 120))
+        sel_wall_pen = QPen(QColor(255, 130, 0))
+        sel_wall_pen.setWidth(4)
+        sel_wall_pen.setCapStyle(Qt.RoundCap)
+        sel_wall_pen.setJoinStyle(Qt.RoundJoin)
+        items[0].setBrush(sel_fill)          # fill item
+        for wall_item in items[1:]:          # wall items
+            wall_item.setPen(sel_wall_pen)
+        self._selection_items = []           # nothing extra to remove
 
     def _clear_selection_overlay(self):
+        """Restore the previously selected channel to its normal style."""
         for item in self._selection_items:
             self.removeItem(item)
         self._selection_items = []
+        if self._selected_ch is not None:
+            self._restore_channel_style(self._selected_ch)
+
+    def _restore_channel_style(self, channel: Channel):
+        items = self._channel_items.get(id(channel), [])
+        if not items:
+            return
+        normal_fill = QBrush(QColor(100, 140, 180, 80))
+        normal_wall_pen = QPen(QColor(44, 80, 120))
+        normal_wall_pen.setWidth(3)
+        normal_wall_pen.setCapStyle(Qt.RoundCap)
+        normal_wall_pen.setJoinStyle(Qt.RoundJoin)
+        items[0].setBrush(normal_fill)
+        for wall_item in items[1:]:
+            wall_item.setPen(normal_wall_pen)
 
     def _channel_at_pos(self, scene_pos):
         """Return the Channel whose graphic item is at scene_pos, or None."""
@@ -613,7 +638,7 @@ class GridScene(QGraphicsScene):
                         src = self._edit_source_ch
                         self._cancel_edit()
                         self._undo_stack.push(EditChannelCommand(self, src, new_ch))
-                        # EditChannelCommand.redo() selects new_ch automatically
+                        self.deselect()
                 else:
                     ch = self._channel_at_pos(event.scenePos())
                     if ch is not None:
