@@ -10,7 +10,7 @@ def _channel_label(ch: Channel) -> str:
     t = d['type']
     if t == 'I':
         return f"I  {d['orientation']}  len={d['length']}  w={d['width']}"
-    corners = ['⌐', 'Γ', 'L', 'J']
+    corners = ['top-left', 'top-right', 'bot-left', 'bot-right']
     corner = corners[d.get('rotation', 0)]
     return f"L {corner}  x={d['len_x']} y={d['len_y']} w={d['width']}"
 

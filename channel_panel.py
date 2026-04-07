@@ -103,27 +103,26 @@ class ChannelPanel(QWidget):
         self._spin_lw.setValue(1)
         l_layout.addWidget(self._spin_lw)
 
-        l_layout.addWidget(QLabel("Corner (rotation):"))
+        l_layout.addWidget(QLabel("Corner:"))
         rot_widget = QWidget()
         rot_layout = QHBoxLayout(rot_widget)
         rot_layout.setContentsMargins(0, 0, 0, 0)
-        rot_layout.setSpacing(2)
-        self._rot_btns = []
-        self._rot_group = QButtonGroup(self)
-        for i, (lbl, tip) in enumerate([
-            ("⌐", "Corner top-left"),
-            ("Γ", "Corner top-right"),
-            ("L", "Corner bottom-left"),
-            ("J", "Corner bottom-right"),
-        ]):
-            btn = QPushButton(lbl)
-            btn.setCheckable(True)
-            btn.setFixedSize(32, 28)
-            btn.setToolTip(tip)
-            self._rot_group.addButton(btn, i)
-            rot_layout.addWidget(btn)
-            self._rot_btns.append(btn)
-        self._rot_btns[0].setChecked(True)
+        rot_layout.setSpacing(4)
+        self._l_rotation = 0
+        self._rot_left_btn = QPushButton("◀")
+        self._rot_left_btn.setFixedSize(32, 28)
+        self._rot_left_btn.setToolTip("Rotate counter-clockwise")
+        self._rot_corner_lbl = QLabel()
+        self._rot_corner_lbl.setAlignment(Qt.AlignCenter)
+        self._rot_corner_lbl.setMinimumWidth(60)
+        self._rot_right_btn = QPushButton("▶")
+        self._rot_right_btn.setFixedSize(32, 28)
+        self._rot_right_btn.setToolTip("Rotate clockwise")
+        rot_layout.addWidget(self._rot_left_btn)
+        rot_layout.addWidget(self._rot_corner_lbl)
+        rot_layout.addWidget(self._rot_right_btn)
+        rot_layout.addStretch()
+        self._update_rot_label()
         l_layout.addWidget(rot_widget)
 
         self._l_widget.setVisible(False)
@@ -139,7 +138,23 @@ class ChannelPanel(QWidget):
         self._spin_lx.valueChanged.connect(self._emit)
         self._spin_ly.valueChanged.connect(self._emit)
         self._spin_lw.valueChanged.connect(self._emit)
-        self._rot_group.buttonClicked.connect(self._emit)
+        self._rot_left_btn.clicked.connect(self._rotate_left)
+        self._rot_right_btn.clicked.connect(self._rotate_right)
+
+    _CORNER_LABELS = ['top-left', 'top-right', 'bot-left', 'bot-right']
+
+    def _update_rot_label(self):
+        self._rot_corner_lbl.setText(self._CORNER_LABELS[self._l_rotation])
+
+    def _rotate_left(self):
+        self._l_rotation = (self._l_rotation - 1) % 4
+        self._update_rot_label()
+        self._emit()
+
+    def _rotate_right(self):
+        self._l_rotation = (self._l_rotation + 1) % 4
+        self._update_rot_label()
+        self._emit()
 
     def _on_type_changed(self, *_):
         is_l = self._btn_l.isChecked()
@@ -158,7 +173,7 @@ class ChannelPanel(QWidget):
                 'len_x': self._spin_lx.value(),
                 'len_y': self._spin_ly.value(),
                 'width': self._spin_lw.value(),
-                'rotation': self._rot_group.checkedId(),
+                'rotation': self._l_rotation,
             }
         return {
             'type': 'I',
@@ -194,8 +209,7 @@ class ChannelPanel(QWidget):
                 self._spin_lx.setValue(d.get('len_x', 3))
                 self._spin_ly.setValue(d.get('len_y', 3))
                 self._spin_lw.setValue(d.get('width', 1))
-                rot = d.get('rotation', 0)
-                for i, btn in enumerate(self._rot_btns):
-                    btn.setChecked(i == rot)
+                self._l_rotation = d.get('rotation', 0) % 4
+                self._update_rot_label()
         finally:
             self._suppress = False
