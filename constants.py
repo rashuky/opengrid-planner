@@ -19,6 +19,7 @@ CANVAS_PX     = CANVAS_TILES * TILE_PX
 MODE_PAINT       = "paint"
 MODE_ADD_GRID    = "add_grid"
 MODE_ADD_CHANNEL = "add_channel"
+MODE_SELECT      = "select"
 
 # ---------------------------------------------------------------------------
 # Colour palette

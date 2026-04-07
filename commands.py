@@ -41,6 +41,48 @@ class PlaceChannelCommand(QUndoCommand):
         logging.info("UNDO place-channel %s", self._channel.to_dict())
 
 
+class DeleteChannelCommand(QUndoCommand):
+    """Undo/redo deleting a Channel from the canvas."""
+
+    def __init__(self, scene, channel: Channel):
+        super().__init__("Delete channel")
+        self._scene = scene
+        self._channel = channel
+
+    def redo(self):
+        self._scene._remove_channel(self._channel)
+        logging.info("REDO delete-channel %s", self._channel.to_dict())
+
+    def undo(self):
+        self._scene._add_channel(self._channel)
+        self._scene.select_channel(id(self._channel))
+        logging.info("UNDO delete-channel %s", self._channel.to_dict())
+
+
+class EditChannelCommand(QUndoCommand):
+    """Undo/redo replacing a channel with a modified version (move/rotate/resize)."""
+
+    def __init__(self, scene, old_channel: Channel, new_channel: Channel):
+        super().__init__("Edit channel")
+        self._scene = scene
+        self._old = old_channel
+        self._new = new_channel
+
+    def redo(self):
+        self._scene._remove_channel(self._old, update_selection=False)
+        self._scene._add_channel(self._new)
+        self._scene.select_channel(id(self._new))
+        logging.info("REDO edit-channel %s -> %s",
+                     self._old.to_dict(), self._new.to_dict())
+
+    def undo(self):
+        self._scene._remove_channel(self._new, update_selection=False)
+        self._scene._add_channel(self._old)
+        self._scene.select_channel(id(self._old))
+        logging.info("UNDO edit-channel %s -> %s",
+                     self._new.to_dict(), self._old.to_dict())
+
+
 class PaintCommand(QUndoCommand):
     """Single undoable paint/erase stroke."""
 

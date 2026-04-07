@@ -13,6 +13,7 @@ class ChannelPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._suppress = False
         self.setMinimumWidth(200)
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignTop)
@@ -84,16 +85,16 @@ class ChannelPanel(QWidget):
         l_layout.setContentsMargins(0, 0, 0, 0)
         l_layout.setSpacing(4)
 
-        l_layout.addWidget(QLabel("X length (tiles):"))
+        l_layout.addWidget(QLabel("X extension (tiles):"))
         self._spin_lx = QSpinBox()
-        self._spin_lx.setRange(2, 40)
-        self._spin_lx.setValue(4)
+        self._spin_lx.setRange(0, 40)
+        self._spin_lx.setValue(3)
         l_layout.addWidget(self._spin_lx)
 
-        l_layout.addWidget(QLabel("Y length (tiles):"))
+        l_layout.addWidget(QLabel("Y extension (tiles):"))
         self._spin_ly = QSpinBox()
-        self._spin_ly.setRange(2, 40)
-        self._spin_ly.setValue(4)
+        self._spin_ly.setRange(0, 40)
+        self._spin_ly.setValue(3)
         l_layout.addWidget(self._spin_ly)
 
         l_layout.addWidget(QLabel("Width (tiles):"))
@@ -147,7 +148,8 @@ class ChannelPanel(QWidget):
         self._emit()
 
     def _emit(self, *_):
-        self.params_changed.emit(self._params())
+        if not self._suppress:
+            self.params_changed.emit(self._params())
 
     def _params(self) -> dict:
         if self._btn_l.isChecked():
@@ -168,3 +170,32 @@ class ChannelPanel(QWidget):
     @property
     def params(self) -> dict:
         return self._params()
+
+    def set_params(self, d: dict):
+        """Update all controls to reflect d without emitting params_changed."""
+        self._suppress = True
+        try:
+            t = d.get('type', 'I')
+            if t == 'I':
+                self._btn_i.setChecked(True)
+                self._btn_l.setChecked(False)
+                self._i_widget.setVisible(True)
+                self._l_widget.setVisible(False)
+                self._spin_len.setValue(d.get('length', 3))
+                self._spin_w.setValue(d.get('width', 1))
+                orient = d.get('orientation', 'H')
+                self._btn_h.setChecked(orient == 'H')
+                self._btn_v.setChecked(orient == 'V')
+            else:
+                self._btn_l.setChecked(True)
+                self._btn_i.setChecked(False)
+                self._i_widget.setVisible(False)
+                self._l_widget.setVisible(True)
+                self._spin_lx.setValue(d.get('len_x', 3))
+                self._spin_ly.setValue(d.get('len_y', 3))
+                self._spin_lw.setValue(d.get('width', 1))
+                rot = d.get('rotation', 0)
+                for i, btn in enumerate(self._rot_btns):
+                    btn.setChecked(i == rot)
+        finally:
+            self._suppress = False

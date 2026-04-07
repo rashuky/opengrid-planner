@@ -7,13 +7,14 @@ from PySide6.QtWidgets import (
     QMainWindow, QPushButton, QColorDialog, QLabel, QSpinBox,
     QHBoxLayout, QVBoxLayout, QWidget, QFileDialog, QMessageBox, QDockWidget,
 )
-from PySide6.QtGui import QKeySequence, QColor
+from PySide6.QtGui import QKeySequence, QColor, QAction
 from PySide6.QtCore import Qt
 
-from constants import MODE_PAINT, MODE_ADD_GRID, MODE_ADD_CHANNEL, PALETTE
+from constants import MODE_PAINT, MODE_ADD_GRID, MODE_ADD_CHANNEL, MODE_SELECT, PALETTE
 from scene import GridScene
 from view import GridView, PROJECT_FILTER
 from channel_panel import ChannelPanel
+from channel_list import ChannelListPanel
 
 
 class MainWindow(QMainWindow):
@@ -29,6 +30,7 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_toolbar()
         self._build_channel_dock()
+        self._build_channel_list_dock()
         self._build_shortcuts()
 
         self.scene.undo_stack.cleanChanged.connect(self._update_title)
@@ -86,6 +88,21 @@ class MainWindow(QMainWindow):
         redo_action.setShortcut(QKeySequence.StandardKey.Redo)
         self.addAction(redo_action)
 
+        rotate_act = QAction("Rotate selected channel", self)
+        rotate_act.setShortcut(QKeySequence("Ctrl+R"))
+        rotate_act.triggered.connect(self.scene.rotate_selected)
+        self.addAction(rotate_act)
+
+        delete_act = QAction("Delete selected channel", self)
+        delete_act.setShortcut(QKeySequence.StandardKey.Delete)
+        delete_act.triggered.connect(self.scene.delete_selected)
+        self.addAction(delete_act)
+
+        escape_act = QAction("Cancel / deselect", self)
+        escape_act.setShortcut(QKeySequence("Escape"))
+        escape_act.triggered.connect(self.scene.cancel_edit)
+        self.addAction(escape_act)
+
     # ------------------------------------------------------------------
     # Toolbar
     # ------------------------------------------------------------------
@@ -113,6 +130,15 @@ class MainWindow(QMainWindow):
         self._add_channel_btn.setToolTip("Channel mode: click to place a cable channel")
         self._add_channel_btn.clicked.connect(lambda: self._set_mode(MODE_ADD_CHANNEL))
         toolbar.addWidget(self._add_channel_btn)
+
+        self._select_btn = QPushButton("↖ Select")
+        self._select_btn.setCheckable(True)
+        self._select_btn.setToolTip(
+            "Select mode: click channel to select · click again to move\n"
+            "Ctrl+R: rotate · Del: delete · Esc: cancel / deselect"
+        )
+        self._select_btn.clicked.connect(lambda: self._set_mode(MODE_SELECT))
+        toolbar.addWidget(self._select_btn)
 
         toolbar.addSeparator()
 
@@ -247,7 +273,12 @@ class MainWindow(QMainWindow):
         self._paint_btn.setChecked(mode == MODE_PAINT)
         self._add_grid_btn.setChecked(mode == MODE_ADD_GRID)
         self._add_channel_btn.setChecked(mode == MODE_ADD_CHANNEL)
-        self._channel_dock.setVisible(mode == MODE_ADD_CHANNEL)
+        self._select_btn.setChecked(mode == MODE_SELECT)
+        # Channel settings dock: visible when adding OR when something is selected
+        self._channel_dock.setVisible(
+            mode == MODE_ADD_CHANNEL or
+            (mode == MODE_SELECT and self.scene.selected_channel is not None)
+        )
 
     def _update_grid_size(self):
         self.scene.set_grid_size(self._spin_gw.value(), self._spin_gh.value())
@@ -274,7 +305,55 @@ class MainWindow(QMainWindow):
         self.scene.set_channel_params(self._channel_panel.params)
 
     def _update_channel_params(self, params: dict):
-        self.scene.set_channel_params(params)
+        if self.scene.mode == MODE_SELECT and self.scene.selected_channel is not None:
+            self.scene.update_selected_channel_params(params)
+        else:
+            self.scene.set_channel_params(params)
+
+    # ------------------------------------------------------------------
+    # Channel list / object tree dock
+    # ------------------------------------------------------------------
+
+    def _build_channel_list_dock(self):
+        self._channel_list_panel = ChannelListPanel()
+        dock = QDockWidget("Object Tree", self)
+        dock.setWidget(self._channel_list_panel)
+        dock.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
+        dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable |
+            QDockWidget.DockWidgetFeature.DockWidgetFloatable |
+            QDockWidget.DockWidgetFeature.DockWidgetClosable
+        )
+        self.addDockWidget(Qt.RightDockWidgetArea, dock)
+        self.tabifyDockWidget(self._channel_dock, dock)
+
+        # Scene → list
+        self.scene.channel_placed.connect(self._channel_list_panel.add_channel)
+        self.scene.channel_erased.connect(self._channel_list_panel.remove_channel)
+        self.scene.channel_selection_changed.connect(self._on_channel_selection_changed)
+
+        # List → scene
+        self._channel_list_panel.channel_selected.connect(self._on_list_channel_selected)
+
+    def _on_list_channel_selected(self, channel_id: int):
+        if channel_id == -1:
+            self.scene.deselect()
+        else:
+            self.scene.select_channel(channel_id)
+
+    def _on_channel_selection_changed(self, channel):
+        is_selected = channel is not None
+        # Update channel settings dock visibility in select mode
+        if self.scene.mode == MODE_SELECT:
+            self._channel_dock.setVisible(is_selected)
+        # Populate channel panel controls with selected channel's params
+        if is_selected:
+            self._channel_panel.set_params(channel.to_dict())
+        # Sync highlight in list (list may already be in sync, but guard)
+        if is_selected:
+            self._channel_list_panel.select_channel(id(channel))
+        else:
+            self._channel_list_panel.deselect()
 
     # ------------------------------------------------------------------
     # Colour picker

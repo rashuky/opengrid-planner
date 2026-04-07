@@ -3,21 +3,26 @@ import logging
 
 from PySide6.QtWidgets import QGraphicsScene
 from PySide6.QtGui import QPen, QColor, QBrush, QUndoStack, QPainterPath
-from PySide6.QtCore import Qt, QRectF
+from PySide6.QtCore import Qt, QRectF, Signal, QPointF
 
 from constants import (
     SMALL_CELL_PX, TILE_CELLS, TILE_PX, CANVAS_TILES, CANVAS_PX,
-    MODE_PAINT, MODE_ADD_GRID, MODE_ADD_CHANNEL,
+    MODE_PAINT, MODE_ADD_GRID, MODE_ADD_CHANNEL, MODE_SELECT,
 )
 from elements.opengrid.region import GridRegion
 from elements.channels.base import Channel
 from elements.channels.i_channel import IChannel
 from elements.channels.l_channel import LChannel
 from elements.channels.registry import channel_from_dict
-from commands import PlaceGridCommand, PlaceChannelCommand, PaintCommand
+from commands import PlaceGridCommand, PlaceChannelCommand, PaintCommand, DeleteChannelCommand, EditChannelCommand
 
 
 class GridScene(QGraphicsScene):
+    # Signals for external observers (channel list panel, main window)
+    channel_placed = Signal(object)      # Channel after _add_channel
+    channel_erased = Signal(object)         # id(channel) after _remove_channel
+    channel_selection_changed = Signal(object)  # Channel | None
+
     def __init__(self):
         super().__init__()
         self.setSceneRect(0, 0, CANVAS_PX, CANVAS_PX)
@@ -46,6 +51,13 @@ class GridScene(QGraphicsScene):
         self._ch_rotation = 0
         self._ch_ghost = None
         self._last_scene_pos = None
+        # selection / editing state
+        self._selected_ch = None
+        self._selection_items: list = []
+        self._editing: bool = False
+        self._edit_source_ch = None
+        self._edit_rotation: int = 0
+        self._edit_orientation: str = 'H'
 
     # ------------------------------------------------------------------
     # Public interface
@@ -55,6 +67,14 @@ class GridScene(QGraphicsScene):
     def undo_stack(self) -> QUndoStack:
         return self._undo_stack
 
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    @property
+    def selected_channel(self):
+        return self._selected_ch
+
     def set_color(self, color: QColor):
         self._current_color = color
 
@@ -63,6 +83,7 @@ class GridScene(QGraphicsScene):
         self._pen_h = max(1, h)
 
     def set_mode(self, mode: str):
+        self._cancel_edit()
         self._mode = mode
         if mode != MODE_ADD_GRID and self._ghost is not None:
             self.removeItem(self._ghost)
@@ -85,8 +106,8 @@ class GridScene(QGraphicsScene):
         self._ch_length = max(1, params.get('length', 3))
         self._ch_width = max(1, params.get('width', 1))
         self._ch_orientation = params.get('orientation', 'H')
-        self._ch_len_x = max(1, params.get('len_x', 3))
-        self._ch_len_y = max(1, params.get('len_y', 3))
+        self._ch_len_x = max(0, params.get('len_x', 3))
+        self._ch_len_y = max(0, params.get('len_y', 3))
         self._ch_rotation = params.get('rotation', 0)
         if self._mode == MODE_ADD_CHANNEL:
             self._update_ch_ghost(self._last_scene_pos)
@@ -168,9 +189,13 @@ class GridScene(QGraphicsScene):
         wall_pen.setJoinStyle(Qt.RoundJoin)
         fill_brush = QBrush(QColor(100, 140, 180, 80))
 
-        items = [self.addPath(channel.fill_path(), QPen(Qt.NoPen), fill_brush)]
+        fill_item = self.addPath(channel.fill_path(), QPen(Qt.NoPen), fill_brush)
+        fill_item.setData(0, id(channel))  # tag for hit-testing in select mode
+        items = [fill_item]
         for path in channel.wall_paths():
-            items.append(self.addPath(path, wall_pen, QBrush(Qt.NoBrush)))
+            wall_item = self.addPath(path, wall_pen, QBrush(Qt.NoBrush))
+            wall_item.setData(0, id(channel))
+            items.append(wall_item)
         for item in items:
             item.setZValue(2)
         return items
@@ -181,14 +206,186 @@ class GridScene(QGraphicsScene):
         self._channel_items[id(channel)] = items
         for cell in channel.occupied_cells():
             self._channel_cells.add(cell)
+        self.channel_placed.emit(channel)
 
-    def _remove_channel(self, channel: Channel):
-        for item in self._channel_items.pop(id(channel), []):
+    def _remove_channel(self, channel: Channel, update_selection: bool = True):
+        cid = id(channel)
+        for item in self._channel_items.pop(cid, []):
             self.removeItem(item)
         if channel in self._channels:
             self._channels.remove(channel)
         for cell in channel.occupied_cells():
             self._channel_cells.discard(cell)
+        if update_selection and self._selected_ch is channel:
+            self._clear_selection_overlay()
+            self._selected_ch = None
+            self.channel_selection_changed.emit(None)
+        self.channel_erased.emit(cid)
+
+    # ------------------------------------------------------------------
+    # Selection
+    # ------------------------------------------------------------------
+
+    def select_channel(self, channel_id: int):
+        """Select the channel with the given id(), draw highlight, emit signal."""
+        self._clear_selection_overlay()
+        ch = next((c for c in self._channels if id(c) == channel_id), None)
+        self._selected_ch = ch
+        if ch is not None:
+            self._draw_selection_overlay(ch)
+        self.channel_selection_changed.emit(ch)
+
+    def deselect(self):
+        self._cancel_edit()
+        self._clear_selection_overlay()
+        if self._selected_ch is not None:
+            self._selected_ch = None
+            self.channel_selection_changed.emit(None)
+
+    def _draw_selection_overlay(self, channel: Channel):
+        x, y, w, h = channel.bounding_box_px()
+        sel_pen = QPen(QColor(255, 165, 0))
+        sel_pen.setWidth(2)
+        sel_pen.setStyle(Qt.DashLine)
+        item = self.addRect(QRectF(x, y, w, h), sel_pen, QBrush(Qt.NoBrush))
+        item.setZValue(5)
+        self._selection_items = [item]
+
+    def _clear_selection_overlay(self):
+        for item in self._selection_items:
+            self.removeItem(item)
+        self._selection_items = []
+
+    def _channel_at_pos(self, scene_pos):
+        """Return the Channel whose graphic item is at scene_pos, or None."""
+        for item in self.items(scene_pos):
+            cid = item.data(0)
+            if cid is not None:
+                ch = next((c for c in self._channels if id(c) == cid), None)
+                if ch is not None:
+                    return ch
+        return None
+
+    # ------------------------------------------------------------------
+    # Edit operations (move / rotate / delete / param change)
+    # ------------------------------------------------------------------
+
+    def rotate_selected(self):
+        """Cycle rotation of the selected channel; enter move-ghost mode."""
+        if self._selected_ch is None:
+            return
+        src = self._edit_source_ch if self._editing else self._selected_ch
+        d = src.to_dict()
+        if d['type'] == 'L':
+            cur = self._edit_rotation if self._editing else d['rotation']
+            self._edit_rotation = (cur + 1) % 4
+            self._edit_orientation = 'H'
+        else:
+            cur = self._edit_orientation if self._editing else d['orientation']
+            self._edit_orientation = 'V' if cur == 'H' else 'H'
+            self._edit_rotation = 0
+        if not self._editing:
+            self._start_editing(self._selected_ch)
+        else:
+            self._update_edit_ghost(self._last_scene_pos)
+
+    def delete_selected(self):
+        """Delete the selected channel via an undoable command."""
+        if self._selected_ch is None:
+            return
+        ch = self._selected_ch
+        self._cancel_edit()
+        self._undo_stack.push(DeleteChannelCommand(self, ch))
+
+    def cancel_edit(self):
+        """Public cancel: stop ghost-reposition mode without committing."""
+        self._cancel_edit()
+
+    def update_selected_channel_params(self, params: dict):
+        """Apply param changes to the selected channel immediately."""
+        if self._selected_ch is None or self._editing:
+            return
+        old = self._selected_ch
+        d = old.to_dict()
+        if d['type'] != params.get('type', d['type']):
+            return  # type change not supported via panel
+        if d['type'] == 'L':
+            new_ch = LChannel(
+                old.col, old.row,
+                params.get('len_x', d['len_x']),
+                params.get('len_y', d['len_y']),
+                params.get('width', d['width']),
+                params.get('rotation', d['rotation']),
+            )
+        else:
+            new_ch = IChannel(
+                old.col, old.row,
+                params.get('length', d['length']),
+                params.get('width', d['width']),
+                params.get('orientation', d['orientation']),
+            )
+        self._undo_stack.push(EditChannelCommand(self, old, new_ch))
+        # EditChannelCommand.redo() already called select_channel(id(new_ch))
+
+    # ------------------------------------------------------------------
+    # Internal edit-ghost helpers
+    # ------------------------------------------------------------------
+
+    def _start_editing(self, channel: Channel):
+        self._edit_source_ch = channel
+        self._editing = True
+        pos = QPointF(channel.col * SMALL_CELL_PX, channel.row * SMALL_CELL_PX)
+        self._last_scene_pos = pos
+        self._update_edit_ghost(pos)
+
+    def _cancel_edit(self):
+        if self._editing:
+            self._editing = False
+            self._edit_source_ch = None
+            if self._ch_ghost is not None:
+                self._ch_ghost.setVisible(False)
+
+    def _make_edit_candidate(self, col: int, row: int) -> Channel:
+        d = self._edit_source_ch.to_dict()
+        if d['type'] == 'L':
+            return LChannel(col, row, d['len_x'], d['len_y'],
+                            d['width'], self._edit_rotation)
+        return IChannel(col, row, d['length'], d['width'], self._edit_orientation)
+
+    def _channel_placement_valid_edit(self, col: int, row: int) -> bool:
+        limit = CANVAS_TILES * TILE_CELLS
+        exclude_cells = set(self._edit_source_ch.occupied_cells())
+        for c, r in self._make_edit_candidate(col, row).occupied_cells():
+            if not (0 <= c < limit and 0 <= r < limit):
+                return False
+            if not self._cell_in_any_region(c, r):
+                return False
+            if (c, r) in self._channel_cells and (c, r) not in exclude_cells:
+                return False
+        return True
+
+    def _update_edit_ghost(self, scene_pos):
+        cell = self._tile_cell_at(scene_pos)
+        if cell is None:
+            if self._ch_ghost is not None:
+                self._ch_ghost.setVisible(False)
+            return
+        col, row = cell
+        valid = self._channel_placement_valid_edit(col, row)
+        pen_color  = QColor(0, 150, 0, 200) if valid else QColor(200, 0, 0, 220)
+        fill_color = QColor(0, 200, 0, 40)  if valid else QColor(255, 0, 0, 50)
+        ghost_pen = QPen(pen_color)
+        ghost_pen.setWidth(1)
+        ghost_pen.setStyle(Qt.DashLine)
+        path = self._make_edit_candidate(col, row).fill_path()
+        if self._ch_ghost is None:
+            self._ch_ghost = self.addPath(path, ghost_pen, QBrush(fill_color))
+            self._ch_ghost.setZValue(10)
+        else:
+            self._ch_ghost.setPath(path)
+            self._ch_ghost.setPen(ghost_pen)
+            self._ch_ghost.setBrush(QBrush(fill_color))
+            self._ch_ghost.setVisible(True)
 
     def _channel_candidate_cells(self, col: int, row: int):
         """Yield cells a channel would occupy if its top-left is at (col, row)."""
@@ -369,6 +566,9 @@ class GridScene(QGraphicsScene):
     def load_dict(self, data: dict):
         if data.get("version") not in (1, 2, 3):
             raise ValueError(f"Unsupported project version: {data.get('version')}")
+        self._cancel_edit()
+        self._clear_selection_overlay()
+        self._selected_ch = None
         for item in list(self._cells.values()):
             self.removeItem(item)
         self._cells.clear()
@@ -404,6 +604,29 @@ class GridScene(QGraphicsScene):
                     channel = self._make_candidate_channel(*cell)
                     self._undo_stack.push(PlaceChannelCommand(self, channel))
                     logging.info("PLACE channel %s", channel.to_dict())
+        elif self._mode == MODE_SELECT:
+            if event.button() == Qt.LeftButton:
+                if self._editing:
+                    cell = self._tile_cell_at(event.scenePos())
+                    if cell and self._channel_placement_valid_edit(*cell):
+                        new_ch = self._make_edit_candidate(*cell)
+                        src = self._edit_source_ch
+                        self._cancel_edit()
+                        self._undo_stack.push(EditChannelCommand(self, src, new_ch))
+                        # EditChannelCommand.redo() selects new_ch automatically
+                else:
+                    ch = self._channel_at_pos(event.scenePos())
+                    if ch is not None:
+                        if ch is self._selected_ch:
+                            # second click on selected channel → enter move mode
+                            d = ch.to_dict()
+                            self._edit_rotation = d.get('rotation', 0)
+                            self._edit_orientation = d.get('orientation', 'H')
+                            self._start_editing(ch)
+                        else:
+                            self.select_channel(id(ch))
+                    else:
+                        self.deselect()
         else:
             cell = self._cell_at(event.scenePos())
             if cell and self._cell_in_any_region(*cell):
@@ -419,6 +642,9 @@ class GridScene(QGraphicsScene):
             self._update_ghost(event.scenePos())
         elif self._mode == MODE_ADD_CHANNEL:
             self._update_ch_ghost(event.scenePos())
+        elif self._mode == MODE_SELECT:
+            if self._editing:
+                self._update_edit_ghost(event.scenePos())
         else:
             cell = self._cell_at(event.scenePos())
             if cell and self._cell_in_any_region(*cell):
@@ -433,3 +659,11 @@ class GridScene(QGraphicsScene):
             label = "erase" if event.button() == Qt.RightButton else "paint"
             self._commit_stroke(label)
         super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            if self._editing:
+                self._cancel_edit()
+            elif self._selected_ch is not None:
+                self.deselect()
+        super().keyPressEvent(event)
